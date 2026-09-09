@@ -27,15 +27,53 @@ Agent backend / orchestration:
 
 Frontend lives in the sibling repo **`anker-hackathon-frontend`**.
 
-## Planned stack
+## Specs
 
-_(TBD — decide with the team, then document here, e.g. Python FastAPI + LangGraph, or Node.)_
+- [`docs/SPECIFICATION.md`](docs/SPECIFICATION.md) — system design: agent graph, guardrails, warranty rule matrix, data pipeline, retrieval, credential status
+- [`docs/API_CONTRACT.md`](docs/API_CONTRACT.md) — endpoints, SSE vocabulary, UI-block schemas. **Shared with the frontend repo; a change lands in both.**
+- [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) — phases, task board, per-scenario definition of done
+- [`docs/COST_ESTIMATE.md`](docs/COST_ESTIMATE.md) — measured unit prices, per-turn token budget, whole-project projection, cost levers
+- [`db/schema.sql`](db/schema.sql) — full DDL, paste-once into the Supabase SQL editor
+
+## Stack
+
+Python 3.11 · FastAPI + `sse-starlette` · **LangGraph** (ReAct + supervisor + `interrupt`/resume on a
+Postgres checkpointer — the brief needs the agent to pause and ask mid-reasoning) · Pydantic v2 schemas
+that double as the UI-block contract.
+
+| Concern | Choice | Note |
+|---|---|---|
+| LLM + vision | `gpt-5.6-terra` via RKAPI (`https://cdn.rkapi.com/v1`, OpenAI-compat) | verified: chat **and** `image_url` parts |
+| Embeddings | `gemini-embedding-001`, 3072-d, direct Google AI Studio key | RKAPI tokens are chat-only (verified 403) |
+| Vectors | Pinecone serverless, index `anker-support`, cosine 3072-d | namespaces: products · kb · tickets · dealers · community |
+| Relational | Supabase Postgres + Storage | orders, tickets, sessions, checkpoints, product mirror |
+| Voice | Deepgram STT/TTS behind `VOICE_ENABLED` | key pending |
+
+> **Gotcha:** RKAPI sits behind Cloudflare and answers a default `curl`/`urllib` User-Agent with
+> `HTTP 403  error code: 1010`. The openai SDK works because it sends its own UA. Any hand-rolled HTTP
+> call must set a `User-Agent` — this looks exactly like a dead key and is not one.
 
 ## Dev setup
 
 ```bash
-# e.g. python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
-uvicorn app.main:app --reload
+python -m venv .venv && source .venv/Scripts/activate    # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+cp .env.example .env                                      # see API_CONTRACT.md §7
+alembic upgrade head                                      # needs SUPABASE_SERVICE_ROLE_KEY
+python scripts/seed_demo.py
+uvicorn app.main:app --reload --port 8000
 ```
 
-_(adjust once the stack is fixed)_
+## Preflight status
+
+Probed live — see [`docs/SPECIFICATION.md`](docs/SPECIFICATION.md) §12 for the full table.
+
+- ✅ RKAPI `gpt-5.6-terra` — chat **and** vision, on all three keys. Note: this key reaches *only* terra, no cheaper tier.
+- ✅ Pinecone index **`anker-support` created** — 3072-d cosine serverless, upsert/query/delete roundtrip passes.
+- ✅ Gemini embeddings — `gemini-embedding-001` and `gemini-embedding-2-preview`, both 3072-d.
+- ✅ Supabase `sb_secret_` key — full row read/write through PostgREST.
+- ❌ **Supabase DDL** — the one blocker. PostgREST cannot create tables, no `exec_sql` rpc, Management API needs a PAT.
+
+**To unblock:** paste [`db/schema.sql`](db/schema.sql) into the Supabase SQL editor once. Or send the DB password (Project Settings → Database) and migrations run themselves — better, since the schema will change during Phase 2.
+
+Costs are modelled in [`docs/COST_ESTIMATE.md`](docs/COST_ESTIMATE.md): ≈ $0.12 credit per troubleshooting turn, ≈ **$493 credit / ~$15 real money** for the entire pilot including dev, eval, a 50-user load test and demo day. Infra runs on free tiers.
