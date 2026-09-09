@@ -1,0 +1,26 @@
+# --- Python / backend ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Env & secrets (never commit real keys) ---
+.env*
+!.env.example
+*.pem
+*.key
+
+# --- Node if the agent includes a gateway ---
+node_modules/
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
