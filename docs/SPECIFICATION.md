@@ -452,28 +452,24 @@ Probed live 2026-09-09 / 2026-09-10. Everything marked ✅ was exercised end to 
 | RKAPI embeddings | ❌ `403 no access` for every embedding model | embeddings do not go through RKAPI |
 | **Pinecone** | ✅ **index `anker-support` created** — 3072-d, cosine, serverless aws/us-east-1, `ready:true`, host `anker-support-sle6cac.svc.aped-4627-b74a.pinecone.io`. Upsert → query → delete roundtrip passed | **done** |
 | **Gemini embeddings** | ✅ `gemini-embedding-001` → 3072-d and `gemini-embedding-2-preview` → 3072-d, both with `taskType=RETRIEVAL_DOCUMENT` | ready; `-001` is the default (it batches; `-2-preview` is single-input) |
-| Supabase `sb_secret_…` | ✅ accepted by PostgREST — full row read/write | ready for all runtime data access |
-| Supabase DDL | ❌ **no path.** PostgREST cannot run DDL; no `exec_sql` rpc exists (`PGRST202`); Management API returns `401` without a personal access token | **the one remaining blocker** — see below |
+| Supabase `sb_secret_…` | ✅ accepted by PostgREST — insert, nested-join select and delete all verified against real tables | ready for all runtime data access |
+| **Supabase DDL** | ✅ **schema applied.** Direct `db.<ref>.supabase.co` is IPv6-only and unreachable from here; the **session-mode pooler** `aws-0-ap-northeast-1.pooler.supabase.com:5432` as `postgres.<ref>` works. PostgreSQL 17.6. `db/schema.sql` ran clean and is idempotent | **done** — 25 tables live, `warranty_policies` seeded |
 | OpenAI direct key | available | fallback embedder (`text-embedding-3-large`, same 3072-d) |
 | Tavily | available | optional allowlisted web search |
 | Deepgram | ❌ not issued | voice stays behind `VOICE_ENABLED=false` |
 
 **Gotcha, cost an hour:** RKAPI sits behind Cloudflare and answers a default `urllib`/`curl` User-Agent with `HTTP 403  error code: 1010`. The openai SDK works because it sends its own UA. Any hand-rolled HTTP call must set a `User-Agent`. This looks exactly like a dead key and is not one.
 
-### The one blocker, and three ways to clear it
+### Nothing blocks the build
 
-The `sb_secret_` key can read and write rows but cannot **create tables**. Any one of these unblocks everything, and the rest of the pilot proceeds either way:
+Every dependency the pilot needs is live and exercised. `scripts/db_bootstrap.py` probes all three Postgres routes, applies `db/schema.sql`, and verifies the result; re-running it is safe.
 
-1. **Paste [`db/schema.sql`](../db/schema.sql) into the Supabase SQL editor once.** Zero credentials shared, takes a minute, and after that the secret key does all row work. *Recommended.*
-2. **Send the database password** (Project Settings → Database → Connection string / Reset password). Then Alembic owns migrations properly and schema changes stop needing a human.
-3. **Send a Supabase personal access token** (`sbp_…`, from Account → Access Tokens). The Management API `POST /v1/projects/{ref}/database/query` then runs arbitrary SQL.
+**Security note from the first apply.** Supabase enables RLS on new public tables automatically, *and* its default privileges hand `anon` table-level `SELECT` **and** `INSERT/UPDATE/DELETE` on every one of them. RLS blocks the writes today, so nothing leaks — but that safety is one `disable row level security` away from a public write endpoint on `orders`. The schema now revokes those write grants from `anon` and `authenticated`, and revokes them from default privileges so future tables inherit the tighter setting. Re-audited after applying: no RLS-off table is anon-readable, and no table is anon-writable.
 
-Option 1 is enough to start. Option 2 is better for the rest of the build, because the schema will change several times during Phase 2.
+Still open, neither blocking:
 
-Also still open (neither blocks the start):
-
-- Deepgram key — voice only.
-- Whether the RKAPI **claude-group** key is available to this project. It would give `claude-haiku-4-5` for `perceive` and rerank at ~⅓ the cost. One probe settles it.
+- **Deepgram key** — voice only; everything else ships without it.
+- Whether the RKAPI **claude-group** key is available to this project. It would put `perceive` and rerank on `claude-haiku-4-5` at roughly ⅓ the cost. One probe settles it.
 
 ---
 

@@ -71,9 +71,16 @@ Probed live — see [`docs/SPECIFICATION.md`](docs/SPECIFICATION.md) §12 for th
 - ✅ RKAPI `gpt-5.6-terra` — chat **and** vision, on all three keys. Note: this key reaches *only* terra, no cheaper tier.
 - ✅ Pinecone index **`anker-support` created** — 3072-d cosine serverless, upsert/query/delete roundtrip passes.
 - ✅ Gemini embeddings — `gemini-embedding-001` and `gemini-embedding-2-preview`, both 3072-d.
-- ✅ Supabase `sb_secret_` key — full row read/write through PostgREST.
-- ❌ **Supabase DDL** — the one blocker. PostgREST cannot create tables, no `exec_sql` rpc, Management API needs a PAT.
+- ✅ Supabase `sb_secret_` key — insert, nested-join select and delete verified against real tables.
+- ✅ **Schema applied** — 25 tables live on PostgreSQL 17.6, `warranty_policies` seeded. Direct `db.<ref>` is IPv6-only from here; the session-mode pooler is the working route.
 
-**To unblock:** paste [`db/schema.sql`](db/schema.sql) into the Supabase SQL editor once. Or send the DB password (Project Settings → Database) and migrations run themselves — better, since the schema will change during Phase 2.
+**Nothing is blocked.** Re-run the bootstrap any time — it is idempotent:
+
+```bash
+export SUPABASE_REF=... SUPABASE_DB_PASSWORD=... SUPABASE_REGION=ap-northeast-1
+python scripts/db_bootstrap.py --apply     # probe routes, apply db/schema.sql, verify
+```
+
+Security note: Supabase's default privileges give `anon` write grants on every public table (RLS blocks them, but only while RLS stays on). `db/schema.sql` revokes those, including from default privileges. Audited clean — no anon-writable table, no RLS-off table readable by anon.
 
 Costs are modelled in [`docs/COST_ESTIMATE.md`](docs/COST_ESTIMATE.md): ≈ $0.12 credit per troubleshooting turn, ≈ **$493 credit / ~$15 real money** for the entire pilot including dev, eval, a 50-user load test and demo day. Infra runs on free tiers.

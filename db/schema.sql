@@ -338,7 +338,20 @@ begin
   end if;
 end $$;
 
--- Everything else stays RLS-off and reachable only by the secret key.
+-- Supabase enables RLS on new public tables automatically and grants anon/authenticated
+-- table-level SELECT *and* INSERT/UPDATE/DELETE by default. RLS blocks the writes today,
+-- but that is one `alter table ... disable row level security` away from a public write
+-- endpoint. Belt and suspenders: take the write grants away entirely. The backend uses
+-- the secret key, which bypasses both.
+revoke insert, update, delete, truncate on all tables in schema public from anon;
+revoke insert, update, delete, truncate on all tables in schema public from authenticated;
+alter default privileges in schema public
+  revoke insert, update, delete on tables from anon;
+alter default privileges in schema public
+  revoke insert, update, delete on tables from authenticated;
+
+-- Everything without a policy above stays invisible to anon: RLS is on and no policy
+-- matches, so PostgREST returns an empty set rather than data.
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Seed: warranty terms. The rule engine reads these; it never guesses.
