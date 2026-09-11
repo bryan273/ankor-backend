@@ -1,0 +1,350 @@
+"""The agent's tool registry.
+
+Each tool is an async function plus a description the planner sees. Two rules hold
+everywhere:
+
+- A tool that finds nothing returns `{"found": false, ...}` and `ok=True`. "No such
+  order" is an answer; only a broken dependency is an error. Collapsing the two is how
+  an agent tells a customer their purchase never happened because a socket timed out.
+- Results are JSON-serialisable and small. The planner sees a trimmed view
+  (`ToolResult.compact`); the composer sees the whole object.
+"""
+from __future__ import annotations
+
+import time
+import uuid
+from typing import Any, Awaitable, Callable, Dict, List, Optional
+
+import structlog
+
+from app.schemas.agent import AgentState, ToolResult
+from app.services import kb, orders, products, tickets, warranty
+
+log = structlog.get_logger(__name__)
+
+ToolFn = Callable[..., Awaitable[Dict[str, Any]]]
+
+
+class Tool:
+    def __init__(self, name: str, description: str, args: str, fn: ToolFn,
+                 label: str = "", needs_product: bool = False):
+        self.name = name
+        self.description = description
+        self.args = args
+        self.fn = fn
+        self.label = label or name.replace("_", " ").capitalize()
+        self.needs_product = needs_product
+
+    def spec(self) -> str:
+        return f"- {self.name}({self.args}) — {self.description}"
+
+
+REGISTRY: Dict[str, Tool] = {}
+
+
+def register(name: str, description: str, args: str, label: str = "",
+             needs_product: bool = False):
+    def deco(fn: ToolFn) -> ToolFn:
+        REGISTRY[name] = Tool(name, description, args, fn, label, needs_product)
+        return fn
+    return deco
+
+
+# ── catalog ───────────────────────────────────────────────────────────────────
+
+@register("search_products",
+          "Find products by name or description. Use when the customer names a product "
+          "you have not resolved yet, or asks what to buy.",
+          "query, brand?, category?, k?", label="Looking up the product")
+async def search_products(state: AgentState, query: str = "", brand: Optional[str] = None,
+                          category: Optional[str] = None, k: int = 8) -> Dict[str, Any]:
+    rows = await products.search_products(query, brand, category, limit=k)
+    if not rows:
+        rows = await kb.search_products_vector(query, k=k, category=category)
+    return {"found": bool(rows), "count": len(rows),
+            "products": [{"sku": r.get("sku"), "name": r.get("name"), "brand": r.get("brand"),
+                          "category": r.get("category"), "price": r.get("price"),
+                          "url": r.get("url"), "image_url": r.get("hero_image"),
+                          "status": r.get("status")} for r in rows[:k]]}
+
+
+@register("get_product",
+          "Full detail for one product: specs, price, manuals, known error codes. "
+          "Use once you know the SKU.",
+          "sku", label="Reading the product details")
+async def get_product(state: AgentState, sku: str = "") -> Dict[str, Any]:
+    row = await products.get_product(sku)
+    if not row:
+        return {"found": False, "sku": sku}
+    return {"found": True, "sku": row["sku"], "name": row["name"], "brand": row["brand"],
+            "category": row["category"], "price": row["price"], "url": row["url"],
+            "image_url": row["hero_image"], "warranty_months": row["warranty_months"],
+            "specs": row["specs"], "error_codes": row["error_codes"][:12],
+            "docs": [{"title": d["title"], "url": d["url"], "kind": d["kind"]}
+                     for d in row["docs"][:6]]}
+
+
+@register("lookup_error_code",
+          "Exact meaning and fix for an error code shown on a device or in a photo. "
+          "Always try this before searching when you have a code.",
+          "code, sku?", label="Looking up that error code")
+async def lookup_error_code(state: AgentState, code: str = "",
+                            sku: Optional[str] = None) -> Dict[str, Any]:
+    product_id = state.resolved.product_id if state.resolved else None
+    if sku and not product_id:
+        row = await products.get_product(sku)
+        product_id = row["product_id"] if row else None
+    rows = await products.find_error_code(code, product_id)
+    return {"found": bool(rows), "code": code, "matches": rows[:3]}
+
+
+# ── knowledge ─────────────────────────────────────────────────────────────────
+
+@register("search_kb",
+          "Search manuals, FAQs and troubleshooting articles. Returns passages with "
+          "citations. The main tool for 'how do I' and 'why is it doing this'.",
+          "query, sku?, doc_type?, k?", label="Checking the manuals")
+async def search_kb(state: AgentState, query: str = "", sku: Optional[str] = None,
+                    doc_type: Optional[str] = None, k: int = 6) -> Dict[str, Any]:
+    sku = sku or (state.resolved.sku if state.resolved else None)
+    name = state.resolved.name if state.resolved else ""
+    chunks = await kb.search_kb(query, sku=sku, doc_type=doc_type, k=k, product_name=name)
+    return {"found": bool(chunks), "count": len(chunks),
+            "passages": [{"text": c.get("text", "")[:900], "title": c.get("title", ""),
+                          "url": c.get("url", ""), "section": c.get("section", ""),
+                          "page": c.get("page"), "sku": c.get("sku"),
+                          "score": round(c.get("score", 0), 3)} for c in chunks]}
+
+
+@register("get_troubleshooting_flow",
+          "A curated step-by-step repair flow for a known symptom. Prefer this over "
+          "search when the symptom is a common one — the steps are ordered and tested.",
+          "symptom, sku?", label="Pulling up the repair steps")
+async def get_troubleshooting_flow(state: AgentState, symptom: str = "",
+                                   sku: Optional[str] = None) -> Dict[str, Any]:
+    product_id = state.resolved.product_id if state.resolved else None
+    if sku and not product_id:
+        row = await products.get_product(sku)
+        product_id = row["product_id"] if row else None
+    flow = await kb.get_troubleshooting_flow(symptom, product_id)
+    if not flow:
+        return {"found": False, "symptom": symptom}
+    steps = flow.get("steps") or []
+    return {"found": True, "symptom": flow["symptom"], "estimated_minutes": flow.get("est_minutes"),
+            "steps": steps, "source_url": flow.get("source_url")}
+
+
+@register("search_tickets",
+          "Search resolved historical support tickets for the same symptom. Often the "
+          "fastest route to a fix that is known to work.",
+          "query, k?", label="Checking similar cases")
+async def search_tickets(state: AgentState, query: str = "", k: int = 5) -> Dict[str, Any]:
+    sku = state.resolved.sku if state.resolved else None
+    rows = await kb.search_tickets(query, k=k, sku=sku)
+    return {"found": bool(rows), "count": len(rows),
+            "tickets": [{"symptom": r.get("symptom", ""), "resolution": r.get("resolution", ""),
+                         "sku": r.get("sku"), "score": round(r.get("score", 0), 3)}
+                        for r in rows]}
+
+
+# ── commerce ──────────────────────────────────────────────────────────────────
+
+@register("lookup_order",
+          "Find an order by number, email or phone. Returns found=false when the order "
+          "is simply not in the system — that is a real answer, not a failure.",
+          "order_no?, email?, phone?", label="Checking your order")
+async def lookup_order(state: AgentState, order_no: Optional[str] = None,
+                       email: Optional[str] = None,
+                       phone: Optional[str] = None) -> Dict[str, Any]:
+    email = email or state.customer_email
+    result = await orders.lookup_order(order_no, email, phone)
+    if result.get("found"):
+        o = result["order"]
+        return {"found": True, "order_no": o["order_no"], "channel": o["channel"],
+                "purchase_date": str(o["purchase_date"]) if o.get("purchase_date") else None,
+                "status": o.get("status"), "customer_name": o.get("customer_name"),
+                "items": [{"sku": i.get("sku"), "name": i.get("name"), "qty": i.get("qty"),
+                           "serial": i.get("serial"), "category": i.get("category"),
+                           "warranty_months": i.get("warranty_months")}
+                          for i in o.get("items", [])],
+                "source": o.get("source", "demo")}
+    return {"found": False, "reason": result.get("reason", "not_found"), "order_no": order_no,
+            "hint": "If the customer bought from a reseller, try lookup_dealer_order next."}
+
+
+@register("lookup_dealer_order",
+          "Check the authorised-dealer directory for an order number the main system "
+          "does not have. Matches the invoice format against each dealer's pattern.",
+          "order_no, dealer_hint?", label="Checking the dealer directory")
+async def lookup_dealer_order(state: AgentState, order_no: str = "",
+                              dealer_hint: Optional[str] = None) -> Dict[str, Any]:
+    result = await orders.lookup_dealer_order(order_no, dealer_hint)
+    if result.get("found"):
+        d = result["dealer_order"]
+        return {"found": True, "match": result["match"], "order_no": d["order_no"],
+                "dealer": {"name": d["dealer_name"], "region": d["region"],
+                           "contact": d["contact"], "service_path": d["service_path"],
+                           "authorized": d["authorized"]},
+                "purchase_date": str(d["purchase_date"]) if d.get("purchase_date") else None,
+                "sku": d.get("sku"), "product_name": d.get("product_name"),
+                "warranty_months": d.get("warranty_months")}
+    return {"found": False, "match": result.get("match", "none"),
+            "reason": result.get("reason"), "dealer": result.get("dealer")}
+
+
+@register("check_warranty",
+          "Decide warranty coverage. This is a RULE ENGINE, not a judgement call — you "
+          "must call it before saying anything about coverage, and you phrase its verdict "
+          "without changing it.",
+          "sku?, purchase_date?, channel?, damage_class?, order_found?, dealer_matched?, "
+          "proof_present?", label="Checking warranty coverage")
+async def check_warranty(
+    state: AgentState, sku: Optional[str] = None, purchase_date: Optional[str] = None,
+    channel: Optional[str] = None, damage_class: Optional[str] = None,
+    order_found: bool = False, dealer_matched: bool = False, proof_present: bool = False,
+) -> Dict[str, Any]:
+    sku = sku or (state.resolved.sku if state.resolved else None)
+    category, term = None, warranty.DEFAULT_TERM_MONTHS
+    if sku:
+        row = await products.get_product(sku)
+        if row:
+            category = row.get("category")
+            term = row.get("warranty_months") or term
+    if category:
+        policy = await kb.db.fetch_one(
+            "select months from warranty_policies where category = %s", (category,))
+        if policy:
+            term = policy["months"]
+
+    # Damage class from the photo when the planner did not supply one.
+    if not damage_class:
+        for facts in state.vlm_facts:
+            dc = (facts.get("detected") or {}).get("damage_class")
+            if dc and dc != "unknown":
+                damage_class = dc
+                break
+
+    decision = warranty.decide(warranty.WarrantyInput(
+        sku=sku, category=category,
+        purchase_date=warranty.parse_date(purchase_date),
+        channel=warranty.classify_channel(channel),
+        damage_class=warranty.classify_damage(damage_class),
+        order_found=order_found, dealer_matched=dealer_matched, proof_present=proof_present,
+        term_months=term,
+        safety_concern=state.perception.safety_concern,
+    ))
+    log.info("warranty.decided", verdict=decision.verdict.value, reason=decision.reason_code)
+    return {"decided": True, **decision.as_payload(), "sku": sku, "category": category,
+            "term_months": term}
+
+
+# ── multimodal + escalation ───────────────────────────────────────────────────
+
+@register("analyze_image",
+          "Ask a specific question about a photo the customer already uploaded, when the "
+          "first pass did not capture what you need.",
+          "question, attachment_id?", label="Looking at your photo again")
+async def analyze_image(state: AgentState, question: str = "",
+                        attachment_id: Optional[str] = None) -> Dict[str, Any]:
+    from app.services.vision import analyze_attachment
+    att_id = attachment_id or (state.attachment_ids[0] if state.attachment_ids else None)
+    if not att_id:
+        return {"found": False, "reason": "no_attachment"}
+    answer = await analyze_attachment(att_id, question)
+    return {"found": True, "attachment_id": att_id, "answer": answer}
+
+
+@register("create_ticket",
+          "Open a support ticket and hand the case to a human. Use when the fixes are "
+          "exhausted, the customer asks for a person, or the situation is unsafe.",
+          "summary, priority?, reason?", label="Opening a ticket for you")
+async def create_ticket(state: AgentState, summary: str = "", priority: str = "",
+                        reason: str = "") -> Dict[str, Any]:
+    failed = sum(1 for o in state.observations if o.tool == "step_result_failed")
+    priority = priority or tickets.derive_priority(
+        state.perception.emotion.value, state.perception.urgency.has_deadline,
+        state.perception.safety_concern, failed,
+    )
+    verdict = None
+    w = state.observation_by_tool("check_warranty")
+    if w:
+        verdict = w.data.get("verdict")
+    ticket = await tickets.create_ticket(
+        summary or state.perception.summary or state.user_message[:200],
+        session_id=state.session_id, customer_id=state.customer_id,
+        product_id=state.resolved.product_id if state.resolved else None,
+        priority=priority, verdict=verdict, reason=reason,
+    )
+    return {"created": True, **{k: str(v) for k, v in ticket.items()}}
+
+
+@register("web_search",
+          "Search Anker's public sites for something the knowledge base does not have. "
+          "Restricted to official domains.",
+          "query", label="Checking Anker's site")
+async def web_search(state: AgentState, query: str = "") -> Dict[str, Any]:
+    from app.services.websearch import search_official
+    results = await search_official(query)
+    return {"found": bool(results), "results": results[:5]}
+
+
+# ── dispatch ──────────────────────────────────────────────────────────────────
+
+def tool_specs(exclude: Optional[List[str]] = None) -> str:
+    exclude = exclude or []
+    return "\n".join(t.spec() for name, t in REGISTRY.items() if name not in exclude)
+
+
+async def run_tool(state: AgentState, name: str, args: Dict[str, Any],
+                   call_id: Optional[str] = None) -> ToolResult:
+    # The caller owns the id: it already announced this call to the client, and a
+    # result carrying a different id can never be paired with it.
+    call_id = call_id or f"call_{uuid.uuid4().hex[:8]}"
+    tool = REGISTRY.get(name)
+    if tool is None:
+        return ToolResult(call_id=call_id, tool=name, ok=False,
+                          summary=f"no such tool: {name}",
+                          data={"error": "unknown_tool",
+                                "available": sorted(REGISTRY)})
+    started = time.perf_counter()
+    try:
+        clean = {k: v for k, v in (args or {}).items() if v is not None}
+        data = await tool.fn(state, **clean)
+        ms = int((time.perf_counter() - started) * 1000)
+        return ToolResult(call_id=call_id, tool=name, ok=True, ms=ms,
+                          summary=summarise(name, data), data=data)
+    except TypeError as e:
+        # A hallucinated argument name is a planner error, not an outage — tell the
+        # planner precisely what went wrong so the retry can be correct.
+        ms = int((time.perf_counter() - started) * 1000)
+        log.warning("tool.bad_args", tool=name, args=args, error=str(e)[:160])
+        return ToolResult(call_id=call_id, tool=name, ok=False, ms=ms,
+                          summary="wrong arguments",
+                          data={"error": "bad_arguments", "detail": str(e)[:200],
+                                "expected": tool.args})
+    except Exception as e:  # noqa: BLE001
+        ms = int((time.perf_counter() - started) * 1000)
+        log.exception("tool.failed", tool=name)
+        return ToolResult(call_id=call_id, tool=name, ok=False, ms=ms,
+                          summary=f"{type(e).__name__}", data={"error": str(e)[:300]})
+
+
+def summarise(tool: str, data: Dict[str, Any]) -> str:
+    """A short human line for the `tool_result` event. The customer sees this."""
+    if tool == "check_warranty":
+        return f"verdict: {data.get('verdict', '?')}"
+    if tool in ("lookup_order", "lookup_dealer_order"):
+        if data.get("found"):
+            return f"found {data.get('order_no', '')}".strip()
+        return "no matching order"
+    if tool == "search_kb":
+        return f"{data.get('count', 0)} passages"
+    if tool == "search_products":
+        return f"{data.get('count', 0)} products"
+    if tool == "get_troubleshooting_flow":
+        return f"{len(data.get('steps', []))} steps" if data.get("found") else "no flow"
+    if tool == "lookup_error_code":
+        return "code recognised" if data.get("found") else "code not in the database"
+    if tool == "create_ticket":
+        return f"ticket {data.get('ticket_no', '')}"
+    return "ok" if data.get("found", True) else "nothing found"

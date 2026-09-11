@@ -24,3 +24,10 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# --- Local artefacts, not source ---
+# Crawl cache is hundreds of MB of fetched HTML and rebuilds itself; uploads are
+# customer photos and must never reach a repo. Both are regenerable.
+data/
+logs/
+*.log

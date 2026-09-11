@@ -7,6 +7,13 @@
 > - **credit-USD** — what RKAPI's console reports. This is the number the API returns.
 > - **real-USD** — what the money actually costs. Measured ratio on a prior project's RKAPI console: `real ≈ credit × 0.0266` (credit figures are ~37.6× inflated). Treat real-USD as an estimate until this account's own console confirms the ratio; treat credit-USD as authoritative.
 
+> ### Read §8 first
+> This document was written before the system existed. **The projection in §1–§7 is kept
+> exactly as forecast**, because a forecast you quietly edit after the fact teaches nobody
+> anything. [§8](#8-what-it-actually-cost--measured-after-the-build) records what the meter
+> said once it was running: the per-turn estimate was **9.5x too high**, in a direction and
+> for reasons worth understanding.
+
 ---
 
 ## 1. Unit prices
@@ -120,3 +127,57 @@ Deepgram, if the key arrives: 200 voice minutes for the demo ≈ **$1.54**, and 
 ## 7. Monitoring
 
 Every model call writes `{model, key_index, input, output, cached, cost_credit}` to `tool_traces`, and the `usage` SSE event surfaces the per-turn number in the trace drawer. `GET /metrics` exposes running totals per session and per day, so the spend is visible during the build rather than discovered at the end.
+
+
+---
+
+## 8. What it actually cost — measured, after the build
+
+The projection above was a model. Here is the meter, over 72 eval turns and two 50-user
+load runs, read from `eval_runs.cost` and the per-turn `usage` event:
+
+| | Projected | Measured | |
+|---|---|---|---|
+| Troubleshooting turn | $0.116 credit | **$0.0122** credit | 9.5x cheaper |
+| Turn under 50-user load | — | **$0.019** credit | |
+| ReAct iterations per turn | 2.5 assumed | **1.6 measured** | |
+| Whole pilot to date | $493 credit projected | **~$3 credit spent** | |
+
+**Why the estimate was so far off**, in order of contribution:
+
+1. **Iterations.** The model was budgeted at 2.5 ReAct iterations per turn; it averages
+   1.6. Cheap deterministic tools are the reason — an alias-table hit or an exact
+   error-code lookup ends the loop that a vector search would have extended. The tools
+   that exist for correctness turned out to be the biggest cost saving too.
+2. **Observation trimming.** `ToolResult.compact()` caps what the planner sees at ~900
+   characters while the composer gets the full object. Observations are the
+   fastest-growing part of the context, and the estimate assumed they were fed forward
+   whole.
+3. **Answer length.** The prompt asks for the shortest answer the situation allows, and
+   the model obeys. Output was budgeted at 3,280 tokens per turn; real answers land far
+   below that, and output bills at 6x the input rate.
+
+The estimate's *structure* held up — input dominates, output is the expensive half per
+token, iterations are the multiplier. Only the constants were wrong, all in the same
+direction, because each was set to a defensible worst case and three worst cases
+multiplied.
+
+**Revised whole-project figure: well under $50 in credits, roughly $1 of real money.**
+The pilot was never cost-constrained; it was constrained by latency, which is why the
+engineering went into the key-pool concurrency (§5, lever 1) rather than into token
+shaving.
+
+### Guard rules, by how often they actually fire
+
+Across 387 stored messages:
+
+| Rule | Fires | Reading |
+|---|---|---|
+| **G1** | 25 | By far the most active. The model reaches for coverage language readily, and this is the rule that stops it before a customer sees a promise nobody authorised. |
+| **G2** | 2 | Steps without a source — rare, because retrieval usually ran. |
+| **G3** | 2 | Invented value. Was noisier until the customer's own words were added to the evidence set: quoting a model number back is not fabrication. |
+| **G1b** | 1 | A draft that tried to upgrade a negative verdict. Rare, and exactly the failure worth catching. |
+
+G1's frequency is the argument for the whole design. A fluent model will discuss
+warranty coverage whenever the topic is nearby; a rule engine plus a guard is what keeps
+that from becoming a commitment.

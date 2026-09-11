@@ -3,7 +3,7 @@
 > **Product name (working):** *Anker Care Agent*
 > **Scope:** an after-sales AI support agent that hears the person, not just the sentence — emotion-aware, multimodal, catalog-grounded, and able to close the loop (diagnose → guide → warrant → escalate) instead of pasting a link.
 > **Repos:** `anker-hackathon-backend` (this) + `anker-hackathon-frontend`.
-> **Status:** specification / plan. Nothing implemented yet.
+> **Status:** built and passing. 98 unit tests, 12/12 scenario evals (S1-S4 plus edge cases), running against 860 crawled products and 463 support articles. See the README for the current numbers.
 > **Companion docs:** [`API_CONTRACT.md`](API_CONTRACT.md) (wire format, shared with frontend) · [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) (phases, tasks, acceptance).
 
 ---
@@ -38,7 +38,7 @@ Two of these are *not* LLM problems and must not be solved by the LLM alone:
                                         │  POST /api/v1/chat  (SSE, one event vocab)
                                         │  POST /api/v1/chat/action  (block action → resume)
 ┌───────────────────────────────────────▼────────────────────────────────────────────────┐
-│  FastAPI (:8000)  ·  LangGraph agent  ·  SSE emitter  ·  rule engine  ·  tool registry  │
+│  FastAPI (:8000)  ·  ReAct agent loop  ·  SSE emitter  ·  rule engine  ·  tool registry  │
 └───┬───────────────┬───────────────────┬──────────────────┬─────────────────┬───────────┘
     │               │                   │                  │                 │
 ┌───▼────┐   ┌──────▼──────┐   ┌────────▼────────┐  ┌──────▼──────┐  ┌───────▼────────┐
@@ -56,7 +56,7 @@ Two of these are *not* LLM problems and must not be solved by the LLM alone:
 | Layer | Choice | Reason |
 |---|---|---|
 | Backend | **Python 3.11 + FastAPI** | async SSE, Pydantic v2 schemas double as the UI-block contract |
-| Agent | **LangGraph** (ReAct + supervisor + `interrupt`) | the brief needs *pause-and-ask-the-user* mid-reasoning; LangGraph's interrupt/resume with a Postgres checkpointer gives that for free. Plain LangChain agents cannot pause cleanly. |
+| Agent | **Explicit async ReAct loop** (`app/agent/graph.py`) | *Changed during the build; LangGraph was the plan.* The deciding factor was streaming: every node emits SSE while it runs — stage pills, friendly narration, per-tool call and result events — and driving that through a graph framework's callback layer costs more control than its scheduling is worth for a linear pipeline with one loop. The one thing LangGraph would have given us free is interrupt/resume, so that is built explicitly: `disambiguate` writes a checkpoint to Postgres and `/chat/action` resumes the same turn. Surviving a page reload was the requirement, and an in-memory graph would not have. |
 | LLM | **`gpt-5.6-terra` via RKAPI** (`https://cdn.rkapi.com/v1`, OpenAI-compat) | verified working; reasoning + vision in one model, cheap on credits |
 | Vision | same model, `image_url` data-URI parts | verified working — no second provider needed |
 | Embeddings | **`gemini-embedding-001`**, 3072-d, direct Google AI Studio key | RKAPI tokens are chat-only (verified 403). Fallback: OpenAI `text-embedding-3-large` (3072-d, same index shape — swap without re-indexing dimension) |
@@ -306,7 +306,7 @@ tool_traces(id, message_id, tool, args jsonb, result jsonb, ms, ok)
 guard_hits(id, message_id, rule_id, detail)
 tickets(id, session_id, customer_id, product_id, priority, status, summary, verdict)
 ticket_events(id, ticket_id, kind, payload jsonb, created_at)
-agent_checkpoints(...)                                     -- LangGraph Postgres checkpointer
+sessions.meta->'checkpoint'                                -- paused-turn state (jsonb)
 eval_cases(id, name, scenario, input jsonb, expect jsonb)
 eval_runs(id, case_id, passed, score jsonb, transcript jsonb, created_at)
 ```
@@ -375,7 +375,7 @@ Envelope:
 }
 ```
 
-A user action `POST /api/v1/chat/action` resumes the paused LangGraph run from its checkpoint with the action injected as an observation. The graph continues where it stopped — it does not re-run the turn.
+A user action `POST /api/v1/chat/action` reloads the checkpoint from `sessions.meta`, marks the block answered, injects the action as an observation, and continues from the ReAct node. It does not re-run the turn, so the customer never repeats themselves.
 
 **Layout**: chat on the left, workbench on the right. Short answers (a fact, a yes/no, a quick fix) stay inline in chat. Long-lived artefacts (a 7-step diagnostic, a warranty verdict, a ticket timeline) render in the workbench with a one-line summary bubble in chat, so the conversation stays readable while the work stays visible.
 
