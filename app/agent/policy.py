@@ -27,6 +27,22 @@ class Policy:
     mention_deadline: bool
     allow_upsell: bool
 
+    def describe(self) -> str:
+        """A short label for the trace: which handling this turn got, and why it looks
+        the way it does. Shown in the step detail so the tone is inspectable rather than
+        something the reader has to infer from the prose."""
+        bits = []
+        bits.append("acknowledge first" if self.acknowledge_first else "answer directly")
+        if self.no_question_opener:
+            bits.append("no question opener")
+        if self.mention_deadline:
+            bits.append("deadline noted")
+        if self.offer_human_early:
+            bits.append("offer a human")
+        if not self.allow_upsell:
+            bits.append("no upsell")
+        return ", ".join(bits)
+
     def as_prompt(self, p: Perception) -> str:
         lines: List[str] = []
         if self.acknowledge_first:

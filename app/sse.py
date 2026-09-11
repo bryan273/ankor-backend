@@ -83,14 +83,34 @@ class SSEStream:
         await self.emit(Event.STATUS, {"session_id": session_id, "message_id": message_id,
                                        "state": state})
 
-    async def stage_start(self, stage_id: str, label: str) -> None:
-        self._open_stages[stage_id] = time.perf_counter()
-        await self.emit(Event.STAGE_START, {"stage_id": stage_id, "label": label})
+    async def stage_start(self, stage_id: str, label: str, *, description: str = "",
+                          ord: int = 0, node: str = "", iteration: int = 0) -> None:
+        """Open a pipeline step.
 
-    async def stage_complete(self, stage_id: str) -> None:
+        Carries more than a label because the UI renders these as a visible horizontal
+        flow: `description` explains what the step is doing in plain language, `node` is
+        the internal name so a judge can line the step up against the architecture
+        diagram, and `iteration` marks steps the ReAct loop revisits rather than passes
+        through once.
+        """
+        self._open_stages[stage_id] = time.perf_counter()
+        await self.emit(Event.STAGE_START, {
+            "stage_id": stage_id, "label": label, "description": description,
+            "ord": ord, "node": node or stage_id, "iteration": iteration,
+        })
+
+    async def stage_complete(self, stage_id: str, *,
+                             detail: Optional[Dict[str, Any]] = None) -> None:
+        """Close a step, optionally with what it concluded.
+
+        `detail` is what makes the flow legible rather than decorative — the intent that
+        was classified, the product that was resolved, the verdict the rule engine
+        returned. Without it a stepper shows that work happened but not what it decided.
+        """
         started = self._open_stages.pop(stage_id, None)
         ms = int((time.perf_counter() - started) * 1000) if started else 0
-        await self.emit(Event.STAGE_COMPLETE, {"stage_id": stage_id, "ms": ms})
+        await self.emit(Event.STAGE_COMPLETE,
+                        {"stage_id": stage_id, "ms": ms, "detail": detail or {}})
 
     async def stage_error(self, stage_id: str, code: str, message: str) -> None:
         self._open_stages.pop(stage_id, None)

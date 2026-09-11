@@ -19,7 +19,7 @@ import structlog
 
 from app.agent.prompts import VLM_SYSTEM
 from app.clients import db
-from app.clients.rkapi import get_rkapi
+from app.clients.llm import get_llm
 
 log = structlog.get_logger(__name__)
 
@@ -37,7 +37,10 @@ async def describe_image(raw: bytes, mime: str,
     vision failure degrades the turn instead of ending it."""
     ask = question or "Describe this image for a support agent."
     try:
-        data, usage = await get_rkapi().json_complete(
+        # Explicitly the vision route: DeepSeek handles the text calls but
+        # cannot see, and silently sending an image there returns confident
+        # nonsense rather than an error.
+        data, usage = await get_llm().vision_json(
             [{"role": "system", "content": VLM_SYSTEM},
              {"role": "user", "content": [
                  {"type": "text", "text": ask},

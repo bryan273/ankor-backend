@@ -124,3 +124,51 @@ async def test_releasing_a_slot_twice_does_not_inflate_capacity():
         a.release()
     finally:
         chat_route._inflight = original
+
+
+# ── follow-ups never come back empty ──────────────────────────────────────────
+
+def _state(**kw):
+    from app.schemas.agent import AgentState
+    base = dict(session_id="s1", message_id="m1", user_message="help")
+    base.update(kw)
+    return AgentState(**base)
+
+
+def _tool(name: str, data: dict):
+    from app.schemas.agent import ToolResult
+    return ToolResult(call_id="c1", tool=name, ok=True, data=data)
+
+
+def test_fallback_suggestions_match_a_warranty_verdict():
+    """After 'we need proof', the questions a customer actually has are about the proof."""
+    from app.agent.graph import fallback_suggestions
+
+    s = _state(observations=[_tool("check_warranty", {"verdict": "needs_proof"})])
+    out = fallback_suggestions(s)
+    assert out
+    assert any("photo" in x.lower() or "verification" in x.lower() for x in out)
+
+
+def test_fallback_suggestions_for_a_safety_case_are_about_safety():
+    from app.agent.graph import fallback_suggestions
+    from app.schemas.agent import Perception
+
+    out = fallback_suggestions(_state(perception=Perception(safety_concern=True)))
+    assert any("safe" in x.lower() or "contact me" in x.lower() for x in out)
+
+
+def test_fallback_suggestions_are_never_empty():
+    """Whatever happened in the turn, the customer is offered a next move."""
+    from app.agent.graph import fallback_suggestions
+
+    assert fallback_suggestions(_state())
+
+
+def test_fallback_suggestions_are_written_in_the_customers_voice():
+    """They render as chips the customer taps, so they must read as the customer's own
+    words rather than as topic labels."""
+    from app.agent.graph import fallback_suggestions
+
+    for text in fallback_suggestions(_state()):
+        assert text.endswith("?"), f"not phrased as a question: {text!r}"

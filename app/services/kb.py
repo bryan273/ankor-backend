@@ -21,7 +21,7 @@ import structlog
 
 from app.clients import db
 from app.clients.embed import get_embedder
-from app.clients.rkapi import get_rkapi
+from app.clients.llm import get_llm
 from app.clients.vectors import NS_COMMUNITY, NS_KB, NS_PRODUCTS, NS_TICKETS, get_vectors
 
 log = structlog.get_logger(__name__)
@@ -52,7 +52,7 @@ async def hyde_expand(question: str, product: str = "") -> str:
     """Rewrite a symptom into manual language. Falls back to the raw question — a
     failed expansion should degrade recall, never the turn."""
     try:
-        text, usage = await get_rkapi().complete(
+        text, usage = await get_llm().complete(
             [{"role": "user", "content": HYDE_PROMPT.format(
                 question=question, product=product or "unknown")}],
             max_tokens=1200,
@@ -102,7 +102,7 @@ async def rerank(question: str, passages: List[Dict[str, Any]], k: int = 6) -> L
         for i, p in enumerate(passages[:24])
     )
     try:
-        data, usage = await get_rkapi().json_complete(
+        data, usage = await get_llm().json_complete(
             [{"role": "user", "content": RERANK_PROMPT.format(
                 question=question, passages=listing, k=k)}],
             max_tokens=1200, default={"ranked": []},

@@ -36,6 +36,15 @@ class Settings(BaseSettings):
     # a worse answer than an honest "we are busy, retry".
     max_concurrent_turns: int = Field(default=24, alias="MAX_CONCURRENT_TURNS")
 
+    # ── text model (DeepSeek; measured ~3x faster than terra on this workload) ─
+    # Routed by capability, not preference: DeepSeek has no vision, so images still go
+    # to terra. `text_provider=rkapi` puts everything back on one model.
+    text_provider: str = Field(default="deepseek", alias="TEXT_PROVIDER")
+    deepseek_api_keys: str = Field(default="", alias="DEEPSEEK_API_KEY")
+    deepseek_model: str = Field(default="deepseek-chat", alias="DEEPSEEK_MODEL")
+    deepseek_base_url: str = Field(default="https://api.deepseek.com",
+                                   alias="DEEPSEEK_BASE_URL")
+
     # ── embeddings (Google AI Studio direct; RKAPI tokens are chat-only) ──────
     gemini_embed_api_key: str = Field(default="", alias="GEMINI_EMBED_API_KEY")
     embed_model: str = Field(default="gemini-embedding-001", alias="EMBED_MODEL")

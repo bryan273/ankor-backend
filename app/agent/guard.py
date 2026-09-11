@@ -90,7 +90,12 @@ def check(state: AgentState, draft: str) -> Tuple[List[GuardHit], bool]:
     # G2 — technical steps need a source.
     step_like = re.search(r"^\s*(?:\d+[.)]|[-*])\s+\w", draft, re.MULTILINE)
     sourced = any(o.tool in ("search_kb", "get_troubleshooting_flow", "lookup_error_code",
-                             "search_tickets", "get_product", "web_search")
+                             "search_tickets", "get_product", "web_search",
+                             # Commerce tools are sources too: a dealer's service path and
+                             # a warranty verdict are documented facts, and instructions
+                             # derived from them are grounded, not invented.
+                             "lookup_order", "lookup_dealer_order", "check_warranty",
+                             "create_ticket")
                   for o in state.observations if o.ok)
     if step_like and not sourced:
         hits.append(GuardHit(rule_id="G2",

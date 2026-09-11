@@ -28,13 +28,24 @@ Two of those are deliberately **not** LLM decisions:
 ## Current state
 
 ```
-100 unit tests                      pass
-12/12 scenario evals                pass   (S1 2/2 · S2 2/2 · S3 2/2 · S4 2/2 · edge 4/4)
-rubric (LLM judge, 0-5)             empathy 4.86 · clarity 4.86 · grounded 4.71 · proactivity 3.71
+123 unit tests                      pass
+21/22 scenario evals                pass   (S1-S4 plus everyday support and adversarial)
+rubric (LLM judge, 0-5)             empathy 4.35 · proactivity 4.35 · clarity 4.06
 50 concurrent users                 50/50 clean, no load shed
 ```
 
-**Latency** — single turn p50 17 s. Under 50 concurrent users: p50 32 s, p90 66 s, and
+The eval corpus is 22 cases, not 4. The brief names four scenarios, but an agent that
+only handles four is a demo — so it also covers the customer who wants a refund rather
+than a repair, the one asking about compatibility before buying, the one who already
+tried everything, the one writing Chinese, and the one trying to talk it into a free
+replacement.
+
+**Models are routed by capability.** `deepseek-chat` handles every text call and
+`gpt-5.6-terra` handles vision, because DeepSeek has none. Measured on this workload:
+perception 0.9 s vs 3.2 s, composition 1.4 s vs 2.8 s, with longer and warmer answers.
+`TEXT_PROVIDER=rkapi` puts everything back on one model.
+
+**Latency** — single turn p50 ~11-15 s. Under 50 concurrent users: p50 32 s, p90 66 s, and
 the first stage pill lands in **0.9 s**, so the interface never looks dead while the model
 works. Cost holds at ~0.019 credits per turn under load.
 
@@ -49,7 +60,7 @@ Live data, all crawled or seeded into Supabase:
 
 | | |
 |---|---|
-| products | 860 across 5 brands (anker, eufy, soundcore, Anker SOLIX, AnkerWork) |
+| products | 898 across 4 brands, 99% with photos, 72% with prices |
 | aliases | 1,396 pairs — the deterministic half of disambiguation |
 | KB articles | 531 from `support.anker.com` / `support.eufy.com`, chunked into 31,406 passages |
 | vectors | **32,498** in Pinecone — 31,406 `kb` · 860 `products` · 220 `tickets` · 12 `dealers`, 3072-d cosine |
@@ -83,8 +94,8 @@ python scripts/embed_corpus.py             # content-hash skip: a re-run is near
 ### Testing
 
 ```bash
-pytest -q                                  # 100 unit tests, no network
-python scripts/eval_run.py                 # 12 scenario evals against a running server
+pytest -q                                  # 123 unit tests, no network
+python scripts/eval_run.py                 # 22 scenario evals against a running server
 python scripts/eval_run.py --scenario S2
 python scripts/load_test.py --users 50     # concurrency
 ```

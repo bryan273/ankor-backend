@@ -163,12 +163,11 @@ async def owned_products(customer_id: Optional[str], candidate_ids: List[str]) -
     return [r["product_id"] for r in rows]
 
 
-def score_by_symptom(candidates: List[Dict[str, Any]], text: str) -> Optional[Dict[str, Any]]:
-    """Pick a candidate whose category the user's own words point at.
+def category_from_symptom(text: str) -> Optional[str]:
+    """Which product category the customer's own words point at, if exactly one.
 
-    Returns a winner only when exactly one category matches. Two matches means the
-    text genuinely does not discriminate, and guessing there is how a breast-pump
-    question gets answered with vacuum instructions.
+    Two categories matching means the wording genuinely does not discriminate, and
+    guessing there is how a breast-pump question gets answered with vacuum instructions.
     """
     if not text:
         return None
@@ -178,11 +177,57 @@ def score_by_symptom(candidates: List[Dict[str, Any]], text: str) -> Optional[Di
         n = sum(1 for s in signals if s in lowered)
         if n:
             hits[category] = n
-    if len(hits) != 1:
+    return next(iter(hits)) if len(hits) == 1 else None
+
+
+def narrow_by_symptom(candidates: List[Dict[str, Any]],
+                      text: str) -> List[Dict[str, Any]]:
+    """Drop candidates from categories the customer's words rule out.
+
+    Narrowing rather than picking is the point. "How do I reset my Omni S1 Pro robot
+    vacuum" names a category unambiguously but still matches two vacuum variants; the
+    old version demanded a single survivor, found two, gave up, and asked "is this a
+    robot vacuum or a breast pump?" — a question the customer had already answered in
+    the same sentence. Narrowing first means any question that remains is the real one.
+    """
+    category = category_from_symptom(text)
+    if not category:
+        return candidates
+    matching = [c for c in candidates if (c.get("category") or "") == category]
+    return matching or candidates
+
+
+def best_name_match(candidates: List[Dict[str, Any]],
+                    mention: str) -> Optional[Dict[str, Any]]:
+    """The candidate whose name actually contains what the customer typed.
+
+    "Omni S1 Pro" matches both "…Omni S1 Pro" and "…Omni S1" through the alias table,
+    but only one of them contains the whole phrase. Longest containment wins; a tie
+    means the mention genuinely does not separate them.
+    """
+    needle = normalise_alias(mention)
+    if not needle:
         return None
-    winner = next(iter(hits))
-    matching = [c for c in candidates if (c.get("category") or "") == winner]
-    return matching[0] if len(matching) == 1 else None
+    # Token containment, not substring: storefront names interleave category words
+    # ("eufy ROBOT VACUUM Omni S1 Pro"), so the customer's phrasing is rarely contiguous
+    # inside them. Every word they typed must appear; order does not matter.
+    wanted = set(needle.split())
+    matching = [c for c in candidates
+                if wanted <= set(normalise_alias(c.get("name", "")).split())]
+    if len(matching) == 1:
+        return matching[0]
+    if not matching:
+        return None
+
+    # Several names contain the mention. Breaking that tie is only safe when they are
+    # variants of the same thing — then the shortest name is the plain model and the
+    # longer ones are bundles. Across categories it is never safe: "S1 Pro" is contained
+    # by both the robot vacuum and the breast pump, and picking the shorter name would
+    # silently answer a breast-pump question with vacuum instructions.
+    categories = {c.get("category") for c in matching}
+    if len(categories) > 1:
+        return None
+    return min(matching, key=lambda c: len(c.get("name", "")))
 
 
 def score_by_photo(candidates: List[Dict[str, Any]],
@@ -230,16 +275,25 @@ async def disambiguate(
         match = next(c for c in candidates if c["product_id"] == owned[0])
         return match, candidates, "purchase_history"
 
-    by_symptom = score_by_symptom(candidates, text)
-    if by_symptom:
-        return by_symptom, candidates, "symptom_vocabulary"
+    # Narrow before deciding. Each discriminator removes candidates it rules out, so a
+    # question that survives to the end is a question the customer has genuinely not
+    # answered — rather than one they answered in the same sentence.
+    narrowed = narrow_by_symptom(candidates, text)
+    if len(narrowed) == 1:
+        return narrowed[0], candidates, "symptom_vocabulary"
 
-    by_photo = score_by_photo(candidates, vlm_facts or [])
+    by_photo = score_by_photo(narrowed, vlm_facts or [])
     if by_photo:
         return by_photo, candidates, "photo"
 
-    log.info("products.ambiguous", mentions=mentions, n=len(candidates))
-    return None, candidates, "ambiguous"
+    exact = best_name_match(narrowed, mentions[0] if mentions else "")
+    if exact:
+        return exact, candidates, "exact_name"
+
+    # Ask, but only among the candidates still standing.
+    log.info("products.ambiguous", mentions=mentions, n=len(narrowed),
+             narrowed_from=len(candidates))
+    return None, narrowed, "ambiguous"
 
 
 async def find_error_code(code: str, product_id: Optional[str] = None) -> List[Dict[str, Any]]:

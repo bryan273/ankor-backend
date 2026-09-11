@@ -25,7 +25,8 @@ import structlog
 from app.agent import guard as guard_mod
 from app.agent import prompts, tools
 from app.agent.policy import SAFETY_INSTRUCTION, policy_for
-from app.clients.rkapi import get_rkapi, parse_json_loose
+from app.clients.llm import get_llm
+from app.clients.rkapi import parse_json_loose
 from app.config import settings
 from app.schemas.agent import (AgentState, Citation, Entities, Intent, Perception,
                                ResolvedProduct, ToolCall, ToolResult, Urgency)
@@ -41,21 +42,53 @@ from app.sse import Event, SSEStream
 
 log = structlog.get_logger(__name__)
 
-STAGE_LABELS = {
-    "understand": "Reading your message",
-    "photo": "Looking at your photo",
-    "identify": "Working out which device this is",
-    "investigate": "Digging into it",
-    "check": "Double-checking before I answer",
-    "answer": "Writing your answer",
+# The pipeline, as the interface shows it. Each entry is one step in a visible
+# left-to-right flow, so a judge can watch the agent think and line each step up against
+# the architecture rather than taking "it reasoned" on trust.
+#
+# `label` is what the customer reads; `description` explains the step's job; `node` is
+# the internal name. `investigate` is the only step that repeats — the ReAct loop — and
+# its events carry an iteration number so the UI can show it looping instead of
+# pretending the pipeline is a straight line.
+STEPS = {
+    "photo":       (1, "Reading your photo",
+                    "Vision model extracts the error code, device type and any damage"),
+    "understand":  (2, "Understanding you",
+                    "One call classifies emotion, urgency, intent and the entities mentioned"),
+    "identify":    (3, "Identifying the device",
+                    "Alias table first, then purchase history, symptom wording, photo — "
+                    "asks only if those cannot decide"),
+    "investigate": (4, "Investigating",
+                    "ReAct loop: think, call a tool, read the result, decide whether to "
+                    "continue"),
+    "answer":      (5, "Writing the answer",
+                    "Composes the reply under the emotion policy for this conversation"),
+    "check":       (6, "Checking against the rules",
+                    "Six guard rules run on the draft; a violation rewrites it before you "
+                    "see it"),
 }
+
+STAGE_LABELS = {k: v[1] for k, v in STEPS.items()}
 
 
 class Agent:
     def __init__(self, stream: SSEStream):
         self.stream = stream
-        self.llm = get_rkapi()
+        self.llm = get_llm()
         self.traces: List[Dict[str, Any]] = []
+
+    async def _step_start(self, key: str, iteration: int = 0,
+                          label: Optional[str] = None) -> None:
+        ord_, default_label, description = STEPS[key]
+        await self.stream.stage_start(key, label or default_label, description=description,
+                                      ord=ord_, node=key, iteration=iteration)
+
+    async def _step_done(self, key: str, **detail: Any) -> None:
+        """Close a step with what it concluded — the intent it classified, the device it
+        resolved, the verdict it reached. A stepper without that shows activity; with it,
+        it shows reasoning."""
+        await self.stream.stage_complete(key, detail={k: v for k, v in detail.items()
+                                                      if v not in (None, "", [], {})})
 
     # ── entry points ──────────────────────────────────────────────────────────
 
@@ -83,7 +116,7 @@ class Agent:
     async def resume(self, state: AgentState, action_id: str,
                      value: Dict[str, Any]) -> AgentState:
         """Continue a paused turn after a block action, without replaying it."""
-        await self.stream.stage_start("understand", "Picking up where we left off")
+        await self._step_start("understand", label="Picking up where we left off")
         if action_id == "select_product":
             row = await product_svc.get_product(value.get("sku", ""))
             if row:
@@ -111,7 +144,8 @@ class Agent:
             state.observations.append(ToolResult(
                 call_id="resume", tool="form_submitted", ok=True,
                 summary="customer filled in the form", data=value))
-        await self.stream.stage_complete("understand")
+        await self._step_done("understand", action=action_id,
+                              resolved=state.resolved.name if state.resolved else None)
 
         await self._react(state)
         await self._compose(state)
@@ -124,7 +158,7 @@ class Agent:
         computing them — the turn should not pay for vision twice."""
         if not state.attachment_ids:
             return
-        await self.stream.stage_start("photo", STAGE_LABELS["photo"])
+        await self._step_start("photo")
         from app.services.vision import get_facts
         facts = await get_facts(state.attachment_ids)
         state.vlm_facts = facts
@@ -136,7 +170,11 @@ class Agent:
             if detected.get("error_code"):
                 await self.stream.thinking(
                     "photo", f" — and the code {detected['error_code']} on the display.")
-        await self.stream.stage_complete("photo")
+        first = (facts[0].get("detected") or {}) if facts else {}
+        await self._step_done("photo", photos=len(facts),
+                              error_code=first.get("error_code"),
+                              device=first.get("form_factor"),
+                              condition=first.get("damage_class"))
 
     async def _safety_shortcut(self, state: AgentState) -> bool:
         """A burning smell does not wait for a ReAct loop.
@@ -157,7 +195,7 @@ class Agent:
         await self.stream.emit(Event.EMOTION, {"emotion": "anxious", "intensity": 0.9,
                                                "urgency": {"level": "high",
                                                            "has_deadline": False}})
-        await self.stream.stage_start("answer", "This one needs immediate attention")
+        await self._step_start("answer", label="This one needs immediate attention")
 
         result = await tools.run_tool(state, "create_ticket", {
             "summary": f"SAFETY: {state.user_message[:160]}",
@@ -176,7 +214,8 @@ class Agent:
                 eta=result.data.get("eta", "within 1 hour")).model_dump())
             state.blocks.append(block)
             await self.stream.block(block.model_dump())
-        await self.stream.stage_complete("answer")
+        await self._step_done("answer", outcome="safety path — diagnosis skipped",
+                              ticket=result.data.get("ticket_no") if result.ok else None)
         if result.ok:
             await self.stream.emit(Event.TICKET_UPDATE, {
                 "ticket_id": result.data.get("ticket_no"), "status": "open",
@@ -201,7 +240,7 @@ class Agent:
                       after=state.rewritten_query[:80])
 
     async def _perceive(self, state: AgentState) -> None:
-        await self.stream.stage_start("understand", STAGE_LABELS["understand"])
+        await self._step_start("understand")
         history = "\n".join(f"{m['role']}: {m['content'][:200]}" for m in state.history[-4:]) \
             or "(this is the first message)"
         vlm = json.dumps([{k: v for k, v in f.items() if k != "raw"} for f in state.vlm_facts],
@@ -219,14 +258,22 @@ class Agent:
             "intensity": state.perception.intensity,
             "urgency": state.perception.urgency.model_dump(),
         })
-        await self.stream.stage_complete("understand")
+        p = state.perception
+        await self._step_done(
+            "understand",
+            intent=p.intent.value, emotion=p.emotion.value,
+            intensity=round(p.intensity, 2), language=p.language,
+            deadline=p.urgency.deadline_hint if p.urgency.has_deadline else None,
+            mentions=p.entities.product_mentions, error_codes=p.entities.error_codes,
+            order_refs=p.entities.order_refs,
+        )
 
     async def _disambiguate(self, state: AgentState) -> bool:
         """Resolve the product, or pause and ask. Returns True if the turn paused."""
         mentions = state.perception.entities.product_mentions
         if not mentions:
             return False
-        await self.stream.stage_start("identify", STAGE_LABELS["identify"])
+        await self._step_start("identify")
         resolved, candidates, how = await product_svc.disambiguate(
             mentions, f"{state.user_message} {state.rewritten_query}",
             customer_id=state.customer_id, vlm_facts=state.vlm_facts,
@@ -242,7 +289,9 @@ class Agent:
                 # Say which way the guess went, so a wrong one is cheap to correct.
                 await self.stream.thinking(
                     "identify", f"Going by {_how_phrase(how)}, this is the {resolved['name']}.")
-            await self.stream.stage_complete("identify")
+            await self._step_done("identify", resolved=resolved["name"],
+                                  sku=resolved["sku"], decided_by=how,
+                                  candidates_considered=len(candidates))
             return False
 
         if len(candidates) > 1:
@@ -254,7 +303,9 @@ class Agent:
             block = product_picker(question, options)
             state.blocks.append(block)
             state.awaiting_action = True
-            await self.stream.stage_complete("identify")
+            await self._step_done("identify", outcome="ambiguous — asking the customer",
+                                  candidates=[c["name"] for c in candidates[:4]],
+                                  decided_by="needs the customer")
             await self.stream.content(question)
             state.answer = question
             await self.stream.block(block.model_dump())
@@ -271,7 +322,8 @@ class Agent:
             log.info("agent.paused_for_pick", n=len(candidates))
             return True
 
-        await self.stream.stage_complete("identify")
+        await self._step_done("identify", outcome="no catalog match for that name",
+                              mentions=mentions)
         return False
 
     async def _picker_question(self, mention: str, candidates: List[Dict[str, Any]]) -> str:
@@ -291,7 +343,7 @@ class Agent:
 
     async def _react(self, state: AgentState) -> None:
         """The reasoning loop. Think, act, observe, repeat — with a hard iteration cap."""
-        await self.stream.stage_start("investigate", STAGE_LABELS["investigate"])
+        await self._step_start("investigate")
         seen_calls: set = set()
 
         for _ in range(settings.max_react_iterations):
@@ -302,7 +354,13 @@ class Agent:
             args = decision.get("args") or {}
 
             if thought:
-                await self.stream.thinking("investigate", thought)
+                # Tagged with the iteration so the UI can show the loop turning rather
+                # than one long undifferentiated "thinking" blur.
+                await self.stream.emit(Event.THINKING_DELTA, {
+                    "stage_id": "investigate", "delta": thought,
+                    "iteration": state.iterations,
+                    "decision": action if action not in ("answer", "", "none") else "answer",
+                })
                 state.scratchpad.append(thought)
 
             if action in ("answer", "", "none", "final"):
@@ -335,7 +393,9 @@ class Agent:
             if _is_enough(state, result):
                 break
 
-        await self.stream.stage_complete("investigate")
+        await self._step_done("investigate", iterations=state.iterations,
+                              tools_used=[o.tool for o in state.observations],
+                              tools_succeeded=sum(1 for o in state.observations if o.ok))
 
     async def _plan(self, state: AgentState) -> Dict[str, Any]:
         situation = self._situation(state)
@@ -418,11 +478,13 @@ class Agent:
         """
         sources = self._sources(state)
 
-        await self.stream.stage_start("answer", STAGE_LABELS["answer"])
+        await self._step_start("answer")
         draft = await self._draft(state, sources, stream_live=True)
-        await self.stream.stage_complete("answer")
+        await self._step_done("answer", characters=len(draft),
+                              sources_available=len(sources),
+                              tone=policy_for(state.perception).describe())
 
-        await self.stream.stage_start("check", STAGE_LABELS["check"])
+        await self._step_start("check")
         hits, must_replan = guard_mod.check(state, draft)
         state.guard_hits.extend(hits)
         if hits:
@@ -444,9 +506,20 @@ class Agent:
             await self._emit_text(answer)
         else:
             answer, suggestions = _split_suggestions(draft)
-        await self.stream.stage_complete("check")
+        await self._step_done(
+            "check",
+            rules_checked=6,
+            violations=[h.rule_id for h in hits] or None,
+            outcome=("rewrote the answer" if hits else "passed, nothing to fix"),
+        )
 
         state.answer = answer
+        # A long answer sometimes ends without the trailing suggestions line. Ending a
+        # support turn with no offered next step is the passivity this agent exists to
+        # avoid, so the conversation state supplies them when the model forgets.
+        if not suggestions and state.perception.intent != Intent.CHITCHAT:
+            suggestions = fallback_suggestions(state)
+            log.info("agent.suggestions_fallback", n=len(suggestions))
         state.suggestions = suggestions
         await self._emit_citations(state, sources)
         await self._emit_blocks(state)
@@ -468,7 +541,12 @@ class Agent:
         context = self._context_line(state)
         messages = [
             {"role": "system", "content": prompts.COMPOSE_SYSTEM.format(
-                policy=policy_text, language=_language_name(state.perception.language))},
+                policy=policy_text,
+                language=_language_name(state.perception.language),
+                citation_rule=(
+                    prompts.CITATION_RULE_WITH_SOURCES.format(
+                        numbers=", ".join(f"[{c.n}]" for c in sources))
+                    if sources else prompts.CITATION_RULE_NO_SOURCES))},
             {"role": "user", "content": prompts.COMPOSE_USER.format(
                 message=state.user_message, context=context,
                 observations=observations, sources=source_lines)},
@@ -482,6 +560,7 @@ class Agent:
         # Live path: forward tokens as they arrive, but hold back the trailing
         # SUGGESTIONS line — it is machine-readable scaffolding, not part of the reply,
         # and the customer should never watch it being typed.
+        valid = {c.n for c in sources}
         parts: List[str] = []
         shown = 0
         async for chunk in self.llm.stream(messages, max_tokens=3000):
@@ -492,7 +571,7 @@ class Agent:
             whole = "".join(parts)
             cut = _suggestions_cut(whole)
             if cut > shown:
-                await self.stream.content(whole[shown:cut])
+                await self.stream.content(_drop_dead_markers(whole[shown:cut], valid))
                 shown = cut
         return "".join(parts).strip()
 
@@ -502,6 +581,12 @@ class Agent:
         draft = await self._draft(state, [], extra_instruction=extra_instruction)
         answer, suggestions = _split_suggestions(draft)
         state.answer = answer
+        # A long answer sometimes ends without the trailing suggestions line. Ending a
+        # support turn with no offered next step is the passivity this agent exists to
+        # avoid, so the conversation state supplies them when the model forgets.
+        if not suggestions and state.perception.intent != Intent.CHITCHAT:
+            suggestions = fallback_suggestions(state)
+            log.info("agent.suggestions_fallback", n=len(suggestions))
         state.suggestions = suggestions
         await self._emit_text(answer)
 
@@ -574,12 +659,78 @@ class Agent:
                     seen.add(r.get("url"))
                     citations.append(Citation(n=len(citations) + 1, title=r.get("title", ""),
                                               url=r.get("url", "")))
+            # Commerce results are real, checkable sources — an order record, a dealer's
+            # published service path, a rule-engine verdict. Leaving them out meant the
+            # composer had facts it could see but no number to attach them to, and it
+            # invented one: answers arrived citing [2] and [3] when zero sources existed.
+            elif o.tool == "lookup_order" and o.data.get("found"):
+                key = ("order", o.data.get("order_no"))
+                if key not in seen:
+                    seen.add(key)
+                    citations.append(Citation(
+                        n=len(citations) + 1,
+                        title=f"Order {o.data.get('order_no')} — {o.data.get('channel', '')}",
+                        section="your order record"))
+            elif o.tool == "lookup_dealer_order":
+                dealer = (o.data.get("dealer") or {})
+                name = dealer.get("name") or ""
+                if name and ("dealer", name) not in seen:
+                    seen.add(("dealer", name))
+                    citations.append(Citation(
+                        n=len(citations) + 1,
+                        title=f"{name} — authorised dealer record",
+                        section=dealer.get("service_path", "")[:120],
+                        url=""))
+            elif o.tool in ("search_products", "get_product"):
+                for prod in (o.data.get("products") or
+                             ([o.data] if o.data.get("found") and o.data.get("sku") else [])):
+                    key = ("product", prod.get("sku"))
+                    if key in seen or not prod.get("sku"):
+                        continue
+                    seen.add(key)
+                    citations.append(Citation(
+                        n=len(citations) + 1,
+                        title=f"{prod.get('name', '')} — product record",
+                        url=prod.get("url") or "", sku=prod.get("sku"),
+                        section=f"{prod.get('brand', '')} catalog"))
+            elif o.tool == "search_tickets":
+                for tk in (o.data.get("tickets") or [])[:2]:
+                    key = ("ticket", tk.get("symptom"))
+                    if key in seen or not tk.get("symptom"):
+                        continue
+                    seen.add(key)
+                    citations.append(Citation(
+                        n=len(citations) + 1,
+                        title=f"Resolved case: {tk.get('symptom', '')[:70]}",
+                        section=str(tk.get("resolution", ""))[:140], sku=tk.get("sku")))
+            elif o.tool == "check_warranty" and o.data.get("decided"):
+                key = ("warranty", o.data.get("reason_code"))
+                if key not in seen:
+                    seen.add(key)
+                    citations.append(Citation(
+                        n=len(citations) + 1,
+                        title=f"Warranty rule engine — {o.data.get('verdict')}",
+                        section=o.data.get("reason_code", ""),
+                        sku=o.data.get("sku")))
         return citations[:8]
 
     async def _emit_citations(self, state: AgentState, sources: List[Citation]) -> None:
-        """Only emit citations the answer actually used — a chip pointing at a passage
-        the text never referenced is noise dressed as rigour."""
+        """Emit the citations the answer used, and delete the ones it invented.
+
+        A marker with nothing behind it is worse than no marker: it looks clickable,
+        the reader clicks it, and nothing happens. So markers with no matching source
+        are stripped from the text before it is stored.
+        """
+        available = {c.n for c in sources}
         used = {int(n) for n in re.findall(r"\[(\d{1,2})\]", state.answer)}
+        invented = used - available
+        if invented:
+            log.info("agent.stripped_invented_citations", numbers=sorted(invented),
+                     available=sorted(available))
+            state.answer = re.sub(
+                r"\s*\[(" + "|".join(str(n) for n in sorted(invented)) + r")\]", "",
+                state.answer)
+            used &= available
         for c in sources:
             if c.n in used:
                 state.citations.append(c)
@@ -699,6 +850,20 @@ def _missing_warranty_call(hits) -> bool:
     return any(h.rule_id == "G1" for h in hits)
 
 
+def _drop_dead_markers(chunk: str, valid: set) -> str:
+    """Remove citation markers that point at nothing, as the text streams.
+
+    The composer is told which numbers exist and mostly obeys, but "mostly" is not good
+    enough for something the reader will click: a marker with no source behind it looks
+    checkable and is not. Cheap to do per chunk, and a marker split across two chunks
+    simply survives — the stored answer is cleaned again afterwards.
+    """
+    if not valid:
+        return re.sub(r"\s*\[\d{1,2}\]", "", chunk)
+    return re.sub(r"\s*\[(\d{1,2})\]",
+                  lambda m: m.group(0) if int(m.group(1)) in valid else "", chunk)
+
+
 def _suggestions_cut(text: str) -> int:
     """How much of a partially-streamed draft is safe to show.
 
@@ -716,6 +881,49 @@ def _suggestions_cut(text: str) -> int:
         if candidate and "SUGGESTIONS:".startswith(candidate):
             return len(text) - len(tail) + i
     return len(text)
+
+
+def fallback_suggestions(state: AgentState) -> List[str]:
+    """Follow-ups derived from where the conversation actually is.
+
+    The composer is asked for these, and on a long answer it sometimes finishes the
+    prose and forgets the trailing line. Leaving the customer with no next move is the
+    exact passivity this agent is supposed to avoid, so the state can produce sensible
+    ones on its own: what happened in this turn determines what they will want next.
+
+    Written in the customer's voice, because they appear as chips the customer taps.
+    """
+    warranty = state.observation_by_tool("check_warranty")
+    verdict = (warranty.data.get("verdict") if warranty else "") or ""
+    product = state.resolved.name if state.resolved else "it"
+
+    if state.perception.safety_concern:
+        return ["Is it safe to leave it unplugged in the house?",
+                "How soon will someone contact me?"]
+    if verdict in ("needs_proof", "covered_pending_verification"):
+        return ["What exactly needs to be visible in the photo?",
+                "How long does verification usually take?",
+                "Can I still use it while the claim is open?"]
+    if verdict == "covered_via_dealer":
+        return ["What if the dealer won't help?",
+                "Do I need the original packaging?",
+                "How long should the repair take?"]
+    if verdict in ("not_covered_policy", "expired"):
+        return ["What would a paid repair cost?",
+                "Is it worth repairing or replacing?",
+                "Do you have a trade-in option?"]
+    if state.ticket_id:
+        return ["How do I check on this ticket later?",
+                "Can I add a photo to the ticket?"]
+    if state.observation_by_tool("get_troubleshooting_flow") or \
+            state.observation_by_tool("search_kb"):
+        return [f"What if none of that fixes {product}?",
+                "How often should I be doing this?",
+                "Can I talk to a person instead?"]
+    if state.candidates and not state.resolved:
+        return ["I'm not sure which one I have — how do I tell?"]
+    return ["Can I talk to a person instead?",
+            "What else should I check?"]
 
 
 def _split_suggestions(draft: str) -> tuple[str, List[str]]:

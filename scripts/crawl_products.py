@@ -24,6 +24,7 @@ import json
 import pathlib
 import re
 import sys
+import html as html_lib
 import time
 from typing import Any, Dict, Iterable, List, Optional, Set
 from xml.etree import ElementTree
@@ -92,6 +93,13 @@ WARRANTY_MONTHS = {"robot_vacuum": 12, "stick_vacuum": 12, "breast_pump": 12,
                    "baby_monitor": 12, "security_camera": 12, "smart_lock": 12,
                    "power_station": 60, "power_bank": 18, "charger": 18, "cable": 18,
                    "audio": 18, "projector": 12, "webcam": 24, "printer": 12, "mower": 24}
+
+
+def clean_name(raw: str) -> str:
+    """Unescape entities and strip the highlight markup storefronts leave in JSON-LD."""
+    text = html_lib.unescape(raw or "")
+    text = re.sub(r"</?[a-zA-Z][^>]{0,40}>", "", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def infer_category(name: str, url: str = "") -> Optional[str]:
@@ -201,16 +209,32 @@ def _walk_ld(data: Any) -> Iterable[Dict[str, Any]]:
                 yield child
 
 
-def first_price(offers: Any) -> Optional[float]:
-    for offer in _walk_ld(offers):
+def first_price(node: Any) -> Optional[float]:
+    """Cheapest sane price anywhere under this node.
+
+    Two shapes in the wild: a `Product` with `offers`, and a `ProductGroup` whose prices
+    live inside `hasVariant[].offers`. Reading only the former left 207 soundcore
+    products priceless. `_walk_ld` already descends into `hasVariant`, so walking the
+    whole node rather than just its `offers` covers both.
+
+    Out-of-stock variants are published with a 9999999.99 sentinel, which would sort to
+    the top of a catalog as the most expensive thing Anker sells. Anything absurd is
+    discarded, and the cheapest real variant wins — that is the "from" price a shopper
+    expects to see.
+    """
+    prices: List[float] = []
+    for entry in _walk_ld(node):
         for key in ("price", "lowPrice", "highPrice"):
-            value = offer.get(key)
-            if value not in (None, ""):
-                try:
-                    return float(str(value).replace(",", ""))
-                except ValueError:
-                    continue
-    return None
+            value = entry.get(key)
+            if value in (None, ""):
+                continue
+            try:
+                amount = float(str(value).replace(",", ""))
+            except (ValueError, TypeError):
+                continue
+            if 0 < amount < 100_000:
+                prices.append(amount)
+    return min(prices) if prices else None
 
 
 def first_image(node: Any) -> Optional[str]:
@@ -224,10 +248,23 @@ def first_image(node: Any) -> Optional[str]:
     return None
 
 
+def og_image(html: str) -> Optional[str]:
+    """The Open Graph image, which storefronts maintain for link previews even when
+    their JSON-LD omits one."""
+    node = HTMLParser(html).css_first('meta[property="og:image"]')
+    return (node.attributes.get("content") or None) if node else None
+
+
 def extract(html: str, url: str, brand: str) -> Optional[Dict[str, Any]]:
-    """JSON-LD first, DOM as a fallback. Returns None when the page is not a product."""
+    """JSON-LD first, DOM as a fallback. Returns None when the page is not a product.
+
+    The two paths are not exclusive for images. A page can publish a JSON-LD `Product`
+    with no `image` field while still carrying a perfectly good `og:image` — soundcore
+    does exactly that, and taking the JSON-LD branch wholesale left 207 products with no
+    photo at all. So the structured data wins for facts, and the image falls back.
+    """
     for node in json_ld_products(html):
-        name = (node.get("name") or "").strip()
+        name = clean_name(node.get("name") or "")
         if not name or len(name) < 3:
             continue
         sku = (node.get("sku") or node.get("mpn") or node.get("productID") or "").strip()
@@ -238,9 +275,10 @@ def extract(html: str, url: str, brand: str) -> Optional[Dict[str, Any]]:
             "brand": BRAND_LABEL.get(brand, brand), "sku": sku[:60], "name": name[:200],
             "slug": url.rstrip("/").split("/")[-1][:120],
             "category": category, "form_factor": category,
-            "price": first_price(node.get("offers")),
+            "price": first_price(node),
             "currency": "USD", "url": url,
-            "hero_image": (first_image(node) or "")[:500] or None,
+            "hero_image": ((first_image(node) or og_image(html) or "")[:500]
+                           or None),
             "status": "active",
             "warranty_months": WARRANTY_MONTHS.get(category or "", 12),
             "description": (node.get("description") or "")[:1500],
@@ -261,7 +299,8 @@ def extract(html: str, url: str, brand: str) -> Optional[Dict[str, Any]]:
     title_node = tree.css_first("h1") or tree.css_first("title")
     if not title_node:
         return None
-    name = re.sub(r"\s*\|\s*(Anker|eufy|soundcore).*$", "", title_node.text(strip=True))[:200]
+    name = clean_name(re.sub(r"\s*\|\s*(Anker|eufy|soundcore).*$", "",
+                             title_node.text(strip=True)))[:200]
     if len(name) < 3:
         return None
     category = infer_category(name, url)
