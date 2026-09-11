@@ -1,21 +1,22 @@
+# Runtime
 fastapi>=0.115
 uvicorn[standard]>=0.32
-sse-starlette>=2.1
-python-multipart>=0.0.12
+python-multipart>=0.0.12       # FastAPI needs this for the photo upload endpoint
 pydantic>=2.9
 pydantic-settings>=2.6
-httpx>=0.27
-openai>=1.55
-google-genai>=0.3
-pinecone>=5.3
-psycopg[binary,pool]>=3.2
-selectolax>=0.3.21
-pymupdf>=1.24
-tenacity>=9.0
+httpx>=0.27                    # Pinecone, Gemini embeddings and the crawler all speak plain HTTP
+openai>=1.55                   # OpenAI-compatible SDK, used for both DeepSeek and RKAPI
+psycopg[binary,pool]>=3.2      # async Postgres over the Supabase pooler
+selectolax>=0.3.21             # HTML parsing for the crawler
 structlog>=24.4
-langgraph>=0.2.50
-langgraph-checkpoint-postgres>=2.0
-langchain-core>=0.3
+
+# Tests
 pytest>=8.3
 pytest-asyncio>=0.24
-respx>=0.21
+
+# Deliberately absent, after checking every import:
+#   langgraph / langchain-core — the agent loop is hand-written (see docs/SPECIFICATION.md
+#     §2.1 for why), and these pulled in the heaviest part of the install for nothing.
+#   pinecone / google-genai — both APIs are called over httpx directly; the SDKs added
+#     dependencies without adding capability.
+#   pymupdf, tenacity, respx — planned, never used.

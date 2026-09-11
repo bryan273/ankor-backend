@@ -71,11 +71,17 @@ Live data, all crawled or seeded into Supabase:
 
 ## Running it
 
+**New machine? Read [`SETUP.md`](SETUP.md)** — it covers both repos, the credentials, the
+two platform traps that cost an hour each, and what to try first. The short version:
+
 ```bash
 python -m venv .venv && .venv/Scripts/pip install -r requirements.txt
-cp .env.example .env          # fill in the keys
+cp .env.example .env          # keys are not in the repo — ask Bryan
 python run.py                 # http://127.0.0.1:8000
 ```
+
+You do **not** need to crawl anything: the catalog, knowledge base and 32k vectors live in
+shared Supabase and Pinecone projects, so a fresh clone talks to the same data.
 
 Use `run.py`, not `uvicorn app.main:app`. On Windows, psycopg's async driver refuses to run on the default `ProactorEventLoop`, and `uvicorn.run()` resets the event-loop policy to the platform default *after* import — so setting a policy at import time is silently undone. `run.py` keeps the loop ours. The failure it prevents is not an exception; the pool just never opens and every query reports a closed pool thirty seconds later.
 

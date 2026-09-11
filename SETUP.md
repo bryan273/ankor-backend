@@ -1,0 +1,154 @@
+# Setup — getting this running on another machine
+
+Two repos, two terminals, about five minutes. **You do not need to re-crawl anything**:
+the product catalog, the support knowledge base and all 32k vectors already live in
+shared Supabase and Pinecone projects, so a fresh clone talks to the same data this was
+built against.
+
+What you do need is the keys, and those are not in the repo (see [Credentials](#credentials)).
+
+---
+
+## 1. Backend
+
+```bash
+git clone https://github.com/tkc88888888/anker-hackathon-backend
+cd anker-hackathon-backend
+
+python -m venv .venv
+# Windows:
+.venv\Scripts\pip install -r requirements.txt
+# macOS / Linux:
+# .venv/bin/pip install -r requirements.txt
+
+cp .env.example .env          # then paste in the keys — see below
+python run.py                 # http://127.0.0.1:8000
+```
+
+Check it came up:
+
+```bash
+curl http://127.0.0.1:8000/healthz
+```
+
+You want `"status": "ok"` and all four dependencies green — `deepseek`, `embed`,
+`pinecone`, `supabase`. If one is red, the `error` field on that entry says which key is
+wrong.
+
+> **Use `python run.py`, not `uvicorn app.main:app`.** On Windows, psycopg's async driver
+> refuses to run on the default event loop, and `uvicorn.run()` resets the loop policy
+> after import — so a policy set at import time is silently undone. `run.py` keeps the
+> loop ours. The failure it prevents is not an exception: the connection pool just never
+> opens, and thirty seconds later every query reports a closed pool.
+
+## 2. Frontend
+
+Second terminal:
+
+```bash
+git clone https://github.com/tkc88888888/anker-hackathon-frontend
+cd anker-hackathon-frontend
+
+npm install
+cp .env.local.example .env.local     # paste the same BACKEND_API_KEY
+npm run dev                          # http://localhost:3000
+```
+
+> **Use `127.0.0.1`, not `localhost`, in `NEXT_PUBLIC_API_URL`.** Node 18+ resolves
+> `localhost` to `::1` while the backend binds IPv4, so the proxy fails with
+> `ECONNREFUSED` against a server that is plainly running.
+
+Open **http://localhost:3000**. You should land on the product gallery.
+
+---
+
+## Credentials
+
+`.env` is gitignored, deliberately — the keys are live and one of them bills real money.
+Get them from Bryan and paste them into your `.env`. Both `.env.example` files list every
+variable with a comment explaining what it does.
+
+The minimum to run:
+
+| Variable | What breaks without it |
+|---|---|
+| `DEEPSEEK_API_KEY` | every text call — the agent cannot answer at all |
+| `RKAPI_OPENAI_KEYS` | photo understanding (and the text fallback if DeepSeek is down) |
+| `GEMINI_EMBED_API_KEY` | retrieval — the agent loses the knowledge base |
+| `PINECONE_API_KEY` | same |
+| `SUPABASE_REF` + `SUPABASE_DB_PASSWORD` | products, orders, dealers, tickets |
+| `BACKEND_API_KEY` | any string, as long as both repos use the same one |
+
+`TAVILY_API_KEY` and `DEEPGRAM_API_KEY` are optional; web search and voice stay switched
+off without them and nothing else is affected.
+
+---
+
+## Try it
+
+The landing page offers the four scenarios from the brief. The two worth watching:
+
+**"my S1 Pro isn't sucking anymore"** — S1 Pro is both a robot vacuum and a wearable
+breast pump, so the agent stops and asks which. Pick the breast pump and the answer
+continues about duckbill valves, not brush rolls. Add "and the milk isn't coming out" to
+the same sentence and it resolves silently without asking.
+
+**"order SE-482911 isn't recognised"** — that invoice exists only in the dealer
+directory, never in the order system. Watch the pipeline strip at the top of the answer:
+it shows the intent it classified, the tools it looped through, and the warranty verdict
+the rule engine returned.
+
+Click any `[1]` in an answer to open the source it came from. Tap a pipeline step to see
+what that step concluded.
+
+---
+
+## Tests
+
+```bash
+pytest -q                                   # 123 unit tests, no network, ~2 s
+python scripts/eval_run.py                  # 22 scenario evals against a running server
+python scripts/eval_run.py --scenario S2    # just the disambiguation cases
+python scripts/smoke_resume.py              # the pause → click → resume round trip
+python scripts/load_test.py --users 50      # concurrency
+```
+
+The eval suite and the load test **cost real credits** (roughly 0.02 per turn, so a full
+eval run is about 0.5 credits). `pytest` costs nothing and needs no network.
+
+---
+
+## Rebuilding the data yourself
+
+Only if you want your own Supabase/Pinecone rather than the shared ones. The crawl is
+polite (~1 request/second) so the first run takes a while; everything is cached on disk
+afterwards, and the embedder skips content whose hash has not changed.
+
+```bash
+python scripts/db_bootstrap.py --apply      # schema — idempotent
+python scripts/crawl_products.py --limit 220
+python scripts/crawl_support.py --limit 550
+python scripts/seed_legacy_products.py      # discontinued products the crawler cannot see
+python scripts/build_aliases.py             # asserts the "s1 pro" ambiguity exists
+python scripts/seed_demo.py                 # asserts the S3 dealer fixture exists
+python scripts/embed_corpus.py
+python scripts/audit_vectors.py             # confirms every vector still maps to a row
+```
+
+Two of those scripts **assert rather than just build**. `build_aliases.py` fails if
+`"s1 pro"` stops being ambiguous across two categories, and `seed_demo.py` fails if
+`SE-482911` ever appears in the orders table. Both of those would quietly turn a headline
+demo into an ordinary lookup, so they fail loudly instead.
+
+---
+
+## If something is wrong
+
+| Symptom | Cause |
+|---|---|
+| Frontend shows `UPSTREAM_UNREACHABLE` | backend not running, or `NEXT_PUBLIC_API_URL` says `localhost` instead of `127.0.0.1` |
+| Every DB call says "pool is already closed" | started with `uvicorn` instead of `python run.py` (Windows) |
+| `403 error code: 1010` from RKAPI | Cloudflare rejecting a default User-Agent — only affects hand-rolled HTTP, the SDK path is fine |
+| Answers arrive but cite nothing | `GEMINI_EMBED_API_KEY` or `PINECONE_API_KEY` is wrong; `/healthz` will show it |
+| `429 BUSY` | working as designed above 60 concurrent turns; retry after 5 s |
+| Port 8000 already in use | an earlier `run.py` is still alive — kill it before restarting |

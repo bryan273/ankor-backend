@@ -31,6 +31,14 @@ async def init_pool(min_size: int = 1, max_size: int = 10) -> AsyncConnectionPoo
         _pool = AsyncConnectionPool(
             url, min_size=min_size, max_size=max_size, open=False,
             kwargs={"row_factory": dict_row},
+            # Supabase's session pooler drops connections that have been idle, and a
+            # pool that hands one out without looking fails the *next* request after a
+            # quiet spell — which is to say, the first request of a demo. `check`
+            # validates a connection before lending it and quietly replaces dead ones;
+            # `max_idle` retires them before the server does it for us.
+            check=AsyncConnectionPool.check_connection,
+            max_idle=180.0,
+            reconnect_timeout=30.0,
         )
         await _pool.open(wait=True, timeout=30)
         log.info("db.pool_open", min=min_size, max=max_size)
