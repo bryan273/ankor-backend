@@ -119,3 +119,47 @@ class HashEmbedder:
 
     async def aclose(self) -> None:
         return None
+
+
+class FastEmbedEmbedder:
+    """ONNX embedder that runs on the laptop with no torch and no server.
+
+    Chosen over sentence-transformers for one practical reason: torch + deps is
+    ~2.5 GB, while fastembed pulls onnxruntime + tokenizers (~200 MB) and the model
+    itself is 130-500 MB. On a machine with little disk headroom that difference is
+    the whole point. Default model is 384-d, so set EMBED_DIM=384 to match.
+
+    First call downloads the model into the local cache (one time).
+    """
+
+    def __init__(self, model: str = "BAAI/bge-small-en-v1.5", dim: int = 384):
+        self.model_name = model or "BAAI/bge-small-en-v1.5"
+        self.dim = dim
+        self._model = None
+
+    def _load(self):
+        if self._model is None:
+            from fastembed import TextEmbedding  # type: ignore
+
+            self._model = TextEmbedding(model_name=self.model_name)
+            self.dim = len(next(iter(self._model.embed(["dim probe"]))))
+        return self._model
+
+    async def embed_one(self, text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> List[float]:
+        return (await self.embed_many([text], task_type, concurrency=1))[0]
+
+    async def embed_many(self, texts: Sequence[str], task_type: str = "RETRIEVAL_DOCUMENT",
+                         concurrency: int = 4) -> List[List[float]]:
+        model = self._load()
+        # ONNX inference is CPU-bound; run it off the event loop so a Colab/async
+        # caller does not stall, and keep one batched pass rather than N calls.
+        loop = asyncio.get_running_loop()
+        vecs = await loop.run_in_executor(
+            None, lambda: [list(map(float, v)) for v in model.embed(list(texts))])
+        return vecs
+
+    async def embed_query(self, text: str) -> List[float]:
+        return await self.embed_one(text, "RETRIEVAL_QUERY")
+
+    async def aclose(self) -> None:
+        self._model = None

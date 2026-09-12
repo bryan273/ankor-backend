@@ -54,11 +54,20 @@ def get_embedder() -> Any:
             api_key=settings.embed_api_key,
             dim=settings.embed_dim,
         )
+    if provider in ("fastembed", "onnx"):
+        from app.adapters.local_embed import FastEmbedEmbedder
+
+        return FastEmbedEmbedder(
+            model=settings.embed_local_model or "BAAI/bge-small-en-v1.5",
+            dim=settings.embed_dim,
+        )
     if provider == "hash":
         from app.adapters.local_embed import HashEmbedder
 
         return HashEmbedder(dim=settings.embed_dim)
-    raise ValueError(f"unknown EMBED_PROVIDER={provider!r} (gemini|openai_compat|hash)")
+    raise ValueError(
+            f"unknown EMBED_PROVIDER={provider!r} "
+            "(gemini|openai_compat|fastembed|hash)")
 
 
 def describe_backends() -> Dict[str, Any]:
