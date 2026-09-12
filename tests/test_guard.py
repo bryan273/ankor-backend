@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import pytest
 
+from app.agent import guard
 from app.agent.guard import check, repair_instruction
 from app.schemas.agent import (AgentState, Emotion, Perception, ResolvedProduct,
                                ToolResult, Urgency)
@@ -222,3 +223,82 @@ def test_g3_does_not_flag_an_error_code_the_customer_reported():
     hits, _ = check(s, "E-42 isn't in our error-code table for your model — could you "
                        "send a photo of the screen?")
     assert "G3" not in [h.rule_id for h in hits]
+
+
+# ── G1 fires on a ruling, not on the topic ────────────────────────────────────
+
+@pytest.mark.parametrize("draft", [
+    "Good news — this is covered under warranty.",
+    "Unfortunately it is not covered.",
+    "We'll replace it free of charge.",
+    "You're eligible for a free replacement.",
+    "The warranty has expired, so a repair would be chargeable.",
+    "That's still under warranty.",
+    "The warranty doesn't cover accidental damage.",
+])
+def test_g1_fires_on_an_actual_coverage_ruling(draft):
+    hits, _ = check(state(), draft)
+    assert "G1" in [h.rule_id for h in hits], f"should have caught: {draft!r}"
+
+
+@pytest.mark.parametrize("draft", [
+    "I'll help you with your warranty claim — first, what's the serial number?",
+    "Let's check the warranty situation once we know the purchase date.",
+    "Your claim is logged as TCK-9633 and an agent will pick it up.",
+    "To start the claim, bring the invoice to any Sinar service point.",
+    "Warranty questions go to the dealer who sold it.",
+])
+def test_g1_stays_quiet_when_warranty_is_merely_the_topic(draft):
+    """The original pattern matched the bare words 'warranty' and 'claim', so ordinary
+    helpful sentences forced a full re-draft — and the customer watched the answer
+    vanish and retype itself on roughly one turn in three."""
+    hits, _ = check(state(), draft)
+    assert "G1" not in [h.rule_id for h in hits], f"false positive on: {draft!r}"
+
+
+# ── G1 coverage detection: the two senses of "covered" ────────────────────────
+#
+# This pattern has been rewritten three times, and every regression looked the same from
+# the outside: the answer visibly rewriting itself mid-stream, because a troubleshooting
+# sentence tripped G1 and forced a re-draft. "The brush is covered in hair" is not a
+# warranty ruling. Both directions are asserted, because narrowing it to kill the false
+# positives is exactly how the real rulings started escaping.
+
+@pytest.mark.parametrize("sentence", [
+    "Your details are covered in the manual.",
+    "The steps below are covered in more detail on the support page.",
+    "Make sure the vent is covered by the filter before you run it.",
+    "The brush is covered in hair — that's what triggers E-05.",
+    "Cleaning is covered in section 3.",
+    "The base station is covered by a plastic lid.",
+    "That topic is covered by our setup guide.",
+    "The sensor was covered with dust.",
+    "I can help with your warranty claim.",
+    "What do you need from me for the claim?",
+])
+def test_ordinary_english_is_not_a_coverage_ruling(sentence: str) -> None:
+    assert guard.COVERAGE_RE.search(sentence) is None, sentence
+
+
+@pytest.mark.parametrize("sentence", [
+    # Contractions are load-bearing: "it is covered" was caught while "it's covered"
+    # walked past for as long as the verb list omitted them.
+    "it's fully covered",
+    "you're covered",
+    "it is covered",
+    "that's still covered",
+    "it was covered",
+    "it isn't covered",
+    "no longer covered",
+    "it's still under warranty",
+    "it is covered by the warranty",
+    "it's covered by us",
+    "not covered by the warranty",
+    "that is out of warranty",
+    "we'll replace it",
+    "the warranty has expired",
+    "covered under the warranty",
+    "you are entitled for a free replacement",
+])
+def test_a_coverage_ruling_is_always_caught(sentence: str) -> None:
+    assert guard.COVERAGE_RE.search(sentence) is not None, sentence

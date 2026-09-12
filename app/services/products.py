@@ -81,9 +81,70 @@ async def find_by_alias(mention: str) -> List[Dict[str, Any]]:
     )
 
 
+async def facets() -> Dict[str, Any]:
+    """Brand and category counts over the WHOLE catalog.
+
+    The storefront cannot derive these from a page of results: a filter rail built from
+    the 60 rows currently on screen shows "Cameras 3" for a catalog that holds 66, and
+    hides every category that happens to fall below the fold. One cheap grouped query
+    is the honest version.
+
+    Uncategorised products are counted but not offered as a filter — a chip labelled
+    `null` helps nobody, and a shopper who cannot find their device has search.
+    """
+    brands = await db.fetch(
+        "select brand, count(*) as n from products where brand is not null "
+        "group by brand order by n desc"
+    )
+    categories = await db.fetch(
+        "select category, count(*) as n from products where category is not null "
+        "group by category order by n desc"
+    )
+    totals = await db.fetch_one(
+        "select count(*) as total, count(price) as priced, "
+        "count(*) filter (where status = 'discontinued') as discontinued from products"
+    )
+    return {
+        "brands": [{"value": r["brand"], "count": r["n"]} for r in brands],
+        "categories": [{"value": r["category"], "count": r["n"]} for r in categories],
+        "total": (totals or {}).get("total", 0),
+        "priced": (totals or {}).get("priced", 0),
+        "discontinued": (totals or {}).get("discontinued", 0),
+    }
+
+
+COLUMNS = ("p.id::text as product_id, p.sku, p.name, p.brand, p.category, p.price, "
+           "p.currency, p.url, p.hero_image, p.status, p.warranty_months")
+
+SIMPLE_ORDERS = {
+    "price_asc": "p.price asc nulls last, p.name",
+    "price_desc": "p.price desc nulls last, p.name",
+    "name": "p.name",
+}
+
+# How an unsearched catalog page is ordered.
+#
+# Two obvious defaults are both wrong, and it took seeing them to know it. Alphabetical
+# sorts names beginning with a digit to the top, so the shop opens on "10-Circuit Manual
+# Transfer Switch" and three mounting brackets. Price-descending opens on six near
+# identical $12,000 SOLIX bundles — the catalog's ceiling, not its range.
+#
+# So: take the best of each category in turn. Rank within each category (photographed
+# first, then priciest), then read across those ranks — every category's flagship, then
+# every category's runner-up. The first screen becomes a vacuum, a power station, a
+# speaker, a camera, which is what a shelf looks like and what tells a customer what
+# is actually sold here. Spare parts and gift cards sort behind all of it.
+FEATURED_ORDER = (
+    "(case when p.category in ('accessory', 'service') then 1 else 0 end), "
+    "p.rank_in_category, p.price desc nulls last, p.name"
+)
+RANK_WINDOW = ("row_number() over (partition by p.category "
+               "order by (p.hero_image is null), p.price desc nulls last, p.name)")
+
+
 async def search_products(
     query: str = "", brand: Optional[str] = None, category: Optional[str] = None,
-    limit: int = 12,
+    limit: int = 12, sort: str = "",
 ) -> List[Dict[str, Any]]:
     """Trigram search over names — the catalog page and the `search_products` tool."""
     clauses, params = ["1=1"], []
@@ -96,21 +157,33 @@ async def search_products(
     if category:
         clauses.append("p.category = %s")
         params.append(category)
-    order = "similarity(p.name, %s) desc, p.name" if query else "p.name"
-    if query:
+    where = " and ".join(clauses)
+
+    # An explicit sort always wins. Otherwise a search is ordered by how well the name
+    # matches — which is the whole point of typing one — and a bare catalog page falls
+    # back to `featured`.
+    if sort in SIMPLE_ORDERS:
+        sql = (f"select {COLUMNS} from products p where {where} "
+               f"order by {SIMPLE_ORDERS[sort]} limit %s")
+    elif query and sort != "featured":
+        # Devices before their spare parts. Trigram similarity rewards short names, so
+        # a search for "s1 pro" returned "Dust Bin For S1 Pro" and "Swivel Wheel For S1
+        # Pro" ahead of the two actual S1 Pro products — the catalog answering a
+        # question nobody asked. Somebody searching a model name wants the machine;
+        # the replacement tank is still there, one screen down.
+        sql = (f"select {COLUMNS} from products p where {where} "
+               f"order by (case when p.category in ('accessory', 'service') "
+               f"then 1 else 0 end), similarity(p.name, %s) desc, p.name limit %s")
         params.append(query)
+    else:
+        # Ranking has to happen inside the subquery: a window function cannot be used
+        # in the ORDER BY of the select that computes it.
+        sql = (f"select {COLUMNS} from ("
+               f"  select *, {RANK_WINDOW} as rank_in_category from products p"
+               f"  where {where}"
+               f") p order by {FEATURED_ORDER} limit %s")
     params.append(limit)
-    return await db.fetch(
-        f"""
-        select p.id::text as product_id, p.sku, p.name, p.brand, p.category, p.price,
-               p.currency, p.url, p.hero_image, p.status, p.warranty_months
-        from products p
-        where {' and '.join(clauses)}
-        order by {order}
-        limit %s
-        """,
-        params,
-    )
+    return await db.fetch(sql, params)
 
 
 async def get_product(sku: str) -> Optional[Dict[str, Any]]:

@@ -230,6 +230,22 @@ async def chat_action(req: ChatActionRequest,
                              headers=SSE_HEADERS)
 
 
+@router.get("/assist/{session_id}")
+async def assist(session_id: str, _: str = Depends(require_api_key)) -> Dict[str, Any]:
+    """The handoff briefing for a human agent: summary, how the customer is feeling,
+    what to avoid, and two or three replies they can send as themselves.
+
+    Deliberately a separate call rather than part of the turn — it is produced when a
+    person picks the case up, which is usually not the moment the turn ended.
+    """
+    from app.services import assist as assist_svc
+
+    session = await session_svc.get_session(session_id)
+    if not session:
+        raise NotFound("no such session", {"session_id": session_id})
+    return await assist_svc.build_briefing(session_id)
+
+
 @router.get("/sessions/{session_id}")
 async def get_session(session_id: str, _: str = Depends(require_api_key)) -> Dict[str, Any]:
     session = await session_svc.get_session(session_id)

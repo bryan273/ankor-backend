@@ -67,16 +67,26 @@ NOT_A_PRODUCT_RE = re.compile(
 CATEGORY_RULES: List[tuple[str, List[str]]] = [
     ("breast_pump", ["breast pump", "wearable pump", "s1 pro breast", "eufy baby", "milk"]),
     ("baby_monitor", ["baby monitor", "smart sock"]),
-    ("robot_vacuum", ["robot vacuum", "robovac", "omni", "robot cleaner", "l60", "x10",
-                      "e25", "e28", "s1 pro robot"]),
-    ("stick_vacuum", ["stick vacuum", "cordless vacuum", "h30", "h20", "s11"]),
+    ("robot_vacuum", ["robot vacuum", "robovac", "omni", "robot cleaner", "eufy l60",
+                      "eufy x10", "x10 pro", "eufy e25", "eufy e28", "s1 pro robot",
+                      "11s max", "robovac 11s"]),
+    # Model-number needles have to carry enough context to be a model number. Bare
+    # "h30" matched `soundcore H30i Wireless On-Ear Headphones` and filed a pair of
+    # headphones under stick vacuums; bare "x10" filed a `Sport X10 Charging Case`
+    # under robot vacuums. Two characters and a digit are not an identifier.
+    ("stick_vacuum", ["stick vacuum", "cordless vacuum", "homevac", "eufy h30",
+                      "eufy h20", "eufy s11"]),
     ("security_camera", ["camera", "doorbell", "homebase", "solocam", "indoor cam",
-                         "floodlight", "eufycam"]),
+                         "floodlight", "eufycam", " cam ", "entry sensor", "alarm",
+                         "freeze sensor", "motion sensor"]),
+    ("tracker", ["smarttrack", "smart track"]),
     ("smart_lock", ["smart lock", "video lock", "door lock"]),
     ("power_station", ["power station", "solix", "solar generator", "f3800", "c1000"]),
-    ("power_bank", ["power bank", "powercore", "magsafe battery", "portable charger"]),
+    ("power_bank", ["power bank", "powercore", "magsafe battery", "portable charger",
+                    "magnetic battery"]),
     ("charger", ["charger", "gan", "usb-c", "wall plug", "charging station", "prime",
-                 "nano", "powerport"]),
+                 "nano", "powerport", "power strip", "charging pad", "wireless charging",
+                 "in-1 cube"]),
     ("cable", ["cable", "powerline", "usb cable"]),
     ("audio", ["earbuds", "headphones", "liberty", "space", "soundcore", "speaker",
                "motion", "sleep a", "aerofit"]),
@@ -84,6 +94,23 @@ CATEGORY_RULES: List[tuple[str, List[str]]] = [
     ("webcam", ["webcam", "powerconf", "conference"]),
     ("printer", ["printer", "eufymake"]),
     ("mower", ["mower", "lawn"]),
+    # Last, deliberately. These needles are broad enough to swallow real devices —
+    # "case", "kit", "adapter" all appear in product names — so they only ever get to
+    # claim what every device rule above has already declined. That leaves them doing
+    # the one job they are for: the spare parts and service lines that otherwise sit
+    # uncategorised, invisible to a category filter and unreachable by a customer
+    # searching for the dustbin that came with their X9 Pro.
+    ("accessory", ["compatible with", "replacement", "spare", "filter", "brush",
+                   "mop pad", "dustbin", "dust bin", "dust cup", "water tank",
+                   "wall mount", "bracket", "carry case", "charging case", "tray",
+                   "adapter", "crevice tool", "sponge", "wheel", "ear fins", "strap",
+                   "tripod", "mount", "screen", "cover", "stand", "detachable base",
+                   "self-empty station", "citric acid", "extension cord", "power cord",
+                   "backpack", "sticker", "greeting card", "wallet", "hdmi switch",
+                   "mouse", "kit", "for s1 pro", "piece", "lens"]),
+    ("service", ["gift card", "giftcard", "care ", "protection plan", "monitoring service",
+                 "extended warranty", "membership", "member gift", "subscription",
+                 "worry-free"]),
 ]
 
 BRAND_LABEL = {"anker": "Anker", "eufy": "eufy", "soundcore": "soundcore",
@@ -102,8 +129,31 @@ def clean_name(raw: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+# A spare part names the device it fits, so the device rules claim it first: "Dust Bin
+# For S1 Pro and Omni S1" matched `omni` and was filed as a robot vacuum, which put
+# sixty replacement tanks and brush guards in the Robot Vacuums aisle.
+#
+# These nouns are checked BEFORE any device rule, and only these — each one is a part
+# and nothing else in this catalog. The broad accessory list at the end of
+# CATEGORY_RULES still mops up whatever the device rules decline.
+PART_FIRST = [
+    "dust bin", "dustbin", "dust cup", "dust in soft rubber", "air out soft rubber",
+    "filter tray", "brush guard", "rolling brush", "bristle brush", "side brush",
+    "mop pad", "mop holder", "water tank", "water reservoir", "dirty water",
+    "clean water", "shock absorber", "shock pads", "swivel wheel", "cleaning tray",
+    "auto-cleaning station", "self-empty station", "detachable base", "crevice tool",
+    "replacement", "compatible with", "spare part", "charging case", "carry case",
+]
+
+# "Filter" alone is a part; "air filter" on a projector is too. But "filter" also
+# appears in nothing else here, so it is safe — kept separate only to document why.
+PART_FIRST += ["washable filter", "detachable filter", "hepa filter"]
+
+
 def infer_category(name: str, url: str = "") -> Optional[str]:
     blob = f"{name} {url}".lower()
+    if any(part in blob for part in PART_FIRST):
+        return "accessory"
     for category, needles in CATEGORY_RULES:
         if any(n in blob for n in needles):
             return category

@@ -47,9 +47,10 @@ class Policy:
         lines: List[str] = []
         if self.acknowledge_first:
             lines.append(
-                "Open by acknowledging how they feel, in one short sentence, in your own "
-                "words. Not a scripted apology — something a person would actually say. "
-                "Then get straight to helping."
+                "Acknowledge how they feel in a CLAUSE — a handful of words in your own "
+                "voice, then a dash, then straight into the help. \"That's rotten timing "
+                "— the brush roll is jammed.\" Not a sentence of sympathy, and never a "
+                "paragraph: to someone already angry, a long preamble reads as stalling."
             )
         else:
             lines.append("Answer directly. No emotional preamble; they just want the answer.")
@@ -68,8 +69,8 @@ class Policy:
             )
         if self.step_granularity == "fine":
             lines.append(
-                "One physical action per step. Say what they should see after each one, so "
-                "they know whether it worked."
+                "One physical action per step, phrased in a single short line. Add what "
+                "they should see only where it is not obvious."
             )
         if self.max_steps_before_checkin:
             lines.append(

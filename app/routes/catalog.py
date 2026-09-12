@@ -16,9 +16,18 @@ router = APIRouter(tags=["catalog"])
 @router.get("/products")
 async def list_products(q: str = "", brand: Optional[str] = None,
                         category: Optional[str] = None, limit: int = 24,
-                        _: str = Depends(require_api_key)) -> Dict[str, Any]:
-    rows = await product_svc.search_products(q, brand, category, limit=min(limit, 100))
+                        sort: str = "", _: str = Depends(require_api_key)) -> Dict[str, Any]:
+    rows = await product_svc.search_products(q, brand, category,
+                                             limit=min(limit, 100), sort=sort)
     return {"count": len(rows), "products": rows}
+
+
+# Declared before `/products/{sku}`, or FastAPI matches this path as a SKU named
+# "facets" and answers 404.
+@router.get("/products/facets")
+async def product_facets(_: str = Depends(require_api_key)) -> Dict[str, Any]:
+    """Brand and category counts over the whole catalog, for the storefront filters."""
+    return await product_svc.facets()
 
 
 @router.get("/products/{sku}")

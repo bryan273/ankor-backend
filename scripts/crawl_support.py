@@ -43,9 +43,23 @@ from scripts.crawl_products import Crawler  # noqa: E402
 
 log = structlog.get_logger("support")
 
+# All four brands run the same Salesforce community platform, and all four allow
+# crawling. Starting with only two of them left the knowledge base 95% eufy: audio had
+# four articles and power stations none, while those are two of the three largest
+# categories in the catalog. The visible symptom was a customer asking how to reset
+# their earbuds and being matched to "How to factory reset my RoboVac's WiFi" — a real
+# answer to a question about a different product, which is the worst kind of retrieval
+# failure because it looks like an answer.
 SITEMAP_INDEXES = [
     "https://support.eufy.com/s/sitemap.xml",
     "https://support.anker.com/s/sitemap.xml",
+    "https://support.soundcore.com/s/sitemap.xml",
+    # Listed, and it yields nothing today: SOLIX's sitemap index has only a product
+    # sitemap (`/s/product/...`) and a view sitemap — no article sitemap at all, so
+    # there is no knowledge base here to crawl. Power-station questions are answered
+    # from support.anker.com, which still carries the PowerHouse line. Left in place
+    # because it costs one request and will start working the day they publish one.
+    "https://support.ankersolix.com/s/sitemap.xml",
 ]
 
 # Boilerplate that wraps every article on this platform. Left in, it dominates the

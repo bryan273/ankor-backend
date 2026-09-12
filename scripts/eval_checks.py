@@ -108,6 +108,30 @@ def no_guard_hit(*rules: str) -> Check:
     return check
 
 
+def coverage_only_from_the_engine(t: Turn) -> Optional[str]:
+    """A coverage ASSERTION needs the rule engine behind it. Saying nothing about
+    coverage is always allowed.
+
+    The earlier version of this check demanded `check_warranty` had run (or G1 had
+    fired) for any warranty question, which inverted the thing it was protecting. The
+    order number in the case does not exist, so the right answer is "I can't find that
+    order" — no verdict, nothing to run the engine on, no guard to trip. The check
+    failed that answer and passed the one that ran the rule engine against a nonexistent
+    order. A test that rewards the worse behaviour is worse than no test.
+
+    The real invariant is the one `guard.COVERAGE_RE` enforces at runtime, so this
+    imports it rather than keeping a second, drifting copy of the pattern.
+    """
+    from app.agent.guard import COVERAGE_RE
+
+    if not COVERAGE_RE.search(t.text):
+        return None
+    if "check_warranty" in t.tools or "G1" in t.guard_hits:
+        return None
+    return ("answer asserts coverage without the rule engine and without a guard hit: "
+            f"{t.text[:120]!r}")
+
+
 BASELINE: List[Check] = [no_error, terminal_once, all_stages_closed, answered]
 
 
@@ -186,3 +210,35 @@ def reached_dealer_path(t: Turn) -> Optional[str]:
     if "lookup_dealer_order" in t.tools:
         return None
     return f"never consulted the dealer directory (tools: {t.tools})"
+
+
+def at_most(chars: int) -> Check:
+    """A reply longer than this is padding.
+
+    The suite previously asserted a *minimum* length, after answers came back too terse
+    to act on. That over-corrected: the model started producing three-to-six paragraph
+    essays, and a customer standing next to a broken machine does not want a report.
+    Both failures are real, so the checks now bound length from both ends.
+    """
+    def check(t: Turn) -> Optional[str]:
+        n = len(t.text.strip())
+        return None if n <= chars else f"answer is {n} chars, expected at most {chars}"
+    return check
+
+
+def no_sympathy_preamble(t: Turn) -> Optional[str]:
+    """The first sentence must carry information, not condolences.
+
+    "I completely understand how frustrating this must be" followed by three more lines
+    before anything useful is the thing angry customers hate most — it reads as stalling.
+    """
+    import re
+    first = re.split(r"(?<=[.!?])\s", t.text.strip(), maxsplit=1)[0] if t.text.strip() else ""
+    padding = re.compile(
+        r"^(i (?:completely |totally |really )?understand|i'?m (?:so |really )?sorry"
+        r"|i can (?:completely |totally )?(?:understand|appreciate|imagine)"
+        r"|that (?:sounds|must be) (?:really |incredibly )?(?:frustrating|annoying|stressful))"
+        r"[^—–-]*$",
+        re.IGNORECASE)
+    return (f"opens with a sympathy-only sentence: {first[:80]!r}"
+            if padding.match(first.strip()) else None)

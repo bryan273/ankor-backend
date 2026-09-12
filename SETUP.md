@@ -58,7 +58,9 @@ npm run dev                          # http://localhost:3000
 > `localhost` to `::1` while the backend binds IPv4, so the proxy fails with
 > `ECONNREFUSED` against a server that is plainly running.
 
-Open **http://localhost:3000**. You should land on the product gallery.
+Open **http://localhost:3000**. You land on the storefront — browse the catalog, and
+the chat launcher is the button in the bottom-right corner. The switch at the top right
+changes which of the three views you are looking at; it is a demo control, not a login.
 
 ---
 
@@ -152,3 +154,28 @@ demo into an ordinary lookup, so they fail loudly instead.
 | Answers arrive but cite nothing | `GEMINI_EMBED_API_KEY` or `PINECONE_API_KEY` is wrong; `/healthz` will show it |
 | `429 BUSY` | working as designed above 60 concurrent turns; retry after 5 s |
 | Port 8000 already in use | an earlier `run.py` is still alive — kill it before restarting |
+| **Page renders but nothing is clickable** | the dev server is refusing its own HMR WebSocket, so React never hydrates — see below |
+
+### The page that looks fine and is completely dead
+
+Worth its own section, because everything about it says the app is working. The layout
+renders, the styling is right, the text is correct — and no button, tab or switch does
+anything. Nothing appears in the terminal, and `curl` reports a perfectly healthy page.
+
+The cause is `allowedDevOrigins` in `next.config.ts`. Declaring that array (we need it
+for ngrok) makes it the *entire* allowlist, and `next dev` origin-checks its HMR
+WebSocket against it. With only the tunnel hosts listed, the browser at
+`http://localhost:3000` had its own upgrade request refused, so hydration never ran and
+the page was server-rendered HTML with no React attached.
+
+`curl` cannot reproduce it: curl sends no `Origin` header, so it is never checked. To
+see it directly, send one —
+
+```bash
+curl -i -H "Origin: http://127.0.0.1:3000" -H "Connection: Upgrade"      -H "Upgrade: websocket" -H "Sec-WebSocket-Version: 13"      -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=="      "http://127.0.0.1:3000/_next/hmr?id=test"
+```
+
+`HTTP/1.1 101 Switching Protocols` is healthy. An empty response means the origin was
+rejected: add `localhost`, `127.0.0.1` and `[::1]` to `allowedDevOrigins`. They are in
+there now, so this should stay fixed — but if you add a host to that array, add it
+*alongside* the local ones, never instead of them.

@@ -15,6 +15,7 @@ system can make, and a metadata filter costs nothing.
 from __future__ import annotations
 
 import json
+import os
 from typing import Any, Dict, List, Optional
 
 import structlog
@@ -115,20 +116,68 @@ async def rerank(question: str, passages: List[Dict[str, Any]], k: int = 6) -> L
     return passages[:k]
 
 
+# Below this, a passage is noise.
+#
+# Calibrated on gemini-embedding-001, whose cosine range is narrow. Measured here:
+# relevant passages score 0.69-0.74, unrelated ones up to 0.68. The bands overlap, so
+# this is a floor for obvious junk and nothing more — tightening it to 0.69 to catch the
+# last off-topic hit also silenced entire legitimate queries, which is the worse error.
+#
+# Relevance is therefore defended in three places, not one: this floor removes the
+# clearly-unrelated, MAX_PER_ARTICLE stops one document monopolising every slot, and the
+# composer is told not to cite a passage it judges irrelevant. Re-measure if the
+# embedding model changes — a floor tuned for one model means nothing for another.
+MIN_RELEVANCE = float(os.getenv("KB_MIN_RELEVANCE", "0.66"))
+
+# At most this many chunks from any one article. Long articles split into many similar
+# chunks that all score alike, and without a cap one document can take every slot: an
+# install question for a product with no coverage came back as six copies of "Display
+# related issues for hubs and docks", which the composer then cited as six sources.
+MAX_PER_ARTICLE = 2
+
+
+def diversify(chunks: List[Dict[str, Any]], k: int) -> List[Dict[str, Any]]:
+    """Keep the best chunks while capping how many come from the same article."""
+    seen: Dict[str, int] = {}
+    out: List[Dict[str, Any]] = []
+    for c in chunks:
+        key = str(c.get("article_id") or c.get("title") or c.get("url") or c.get("id"))
+        if seen.get(key, 0) >= MAX_PER_ARTICLE:
+            continue
+        seen[key] = seen.get(key, 0) + 1
+        out.append(c)
+        if len(out) >= k:
+            break
+    return out
+
+
 async def search_kb(
     query: str, sku: Optional[str] = None, doc_type: Optional[str] = None,
     k: int = 6, use_hyde: bool = True, product_name: str = "",
 ) -> List[Dict[str, Any]]:
-    """The tool the agent calls. Returns citation-ready chunks."""
+    """The tool the agent calls. Returns citation-ready chunks.
+
+    Returning nothing is a valid and useful answer. The corpus does not cover every
+    product, and handing the composer six weakly-related passages invites it to dress
+    them up as an answer — far worse than the agent saying it has no guide for this
+    device and asking what the customer can see.
+    """
     search_text = await hyde_expand(query, product_name) if use_hyde else query
-    candidates = await vector_search(search_text, NS_KB, top_k=30, sku=sku, doc_type=doc_type)
+    candidates = await vector_search(search_text, NS_KB, top_k=40, sku=sku, doc_type=doc_type)
     if not candidates and sku:
         # The SKU filter can be too tight when a manual chunk was indexed against a
         # product family rather than a variant. Retry unfiltered before giving up.
         log.info("kb.filter_relaxed", sku=sku)
-        candidates = await vector_search(search_text, NS_KB, top_k=20)
-    ranked = await rerank(query, candidates, k=k)
-    return await _hydrate(ranked)
+        candidates = await vector_search(search_text, NS_KB, top_k=25)
+
+    usable = [c for c in candidates if c.get("score", 0) >= MIN_RELEVANCE]
+    if not usable:
+        log.info("kb.nothing_relevant", query=query[:70],
+                 best=round(candidates[0].get("score", 0), 3) if candidates else 0)
+        return []
+
+    ranked = await rerank(query, usable, k=k * 2)
+    return await _hydrate(diversify(ranked, k))
 
 
 async def _hydrate(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

@@ -20,12 +20,49 @@ from app.schemas.agent import AgentState, GuardHit
 
 log = structlog.get_logger(__name__)
 
-# Words that make a coverage promise. Deliberately broad — a false positive costs one
-# extra rule-engine call, a false negative costs a warranty the company never owed.
+# An ASSERTION about coverage, not the topic of coverage.
+#
+# This was originally "deliberately broad" and matched the bare words `warranty`,
+# `coverage` and `claim`. That made it fire on ordinary helpful sentences — "I'll help
+# you with your claim", "let's check the warranty" — and each false hit forced a full
+# re-draft. The customer watched the answer vanish and retype itself, repeatedly, for
+# no reason: roughly one turn in three.
+#
+# So the pattern now requires a statement about whether something IS or IS NOT covered.
+# Discussing warranty is free; ruling on it is what needs the engine. A false negative
+# still costs more than a false positive, which is why every phrasing of a verdict is
+# here, in both directions.
 COVERAGE_RE = re.compile(
-    r"\b(under warranty|covered|coverage|warrant(?:y|ies)|free (?:of charge|replacement|repair)|"
-    r"replace(?:ment|d)? (?:free|at no cost)|refund|money back|no charge|"
-    r"we'?ll (?:replace|repair|refund)|claim)\b",
+    r"\b("
+    # "That's still under warranty" contracts the verb away, so the verb is optional
+    # when a definiteness word ("still", "no longer") is doing the asserting instead.
+    r"(?:(?:is|isn'?t|is not|are|aren'?t|was|wasn'?t|'s|'re)\s+)?"
+    r"(?:still\s+|no longer\s+)?(?:under|in|out of)\s+warranty"
+    # "Covered" is two different words. One is a warranty ruling; the other is ordinary
+    # English — "the brush is covered in hair", "that's covered in the manual", "the
+    # vent is covered by the filter". Matching both made G1 fire on a troubleshooting
+    # sentence and force a pointless re-draft, which is what the answer visibly
+    # rewriting itself mid-stream looked like from the outside.
+    #
+    # The sense is decided by what follows: "covered in"/"covered with" is never a
+    # ruling, and "covered by" is one only when the warranty (or we) is doing the
+    # covering. Nothing following at all — "it's fully covered" — is a ruling.
+    #
+    # The contractions are load-bearing too. Without them "it is covered" was caught
+    # while "it's covered" was not, and people contract.
+    r"|(?:is|isn'?t|is not|are|aren'?t|'s|'re|was|wasn'?t|were|weren'?t)"
+    r"\s+(?:still\s+|fully\s+|completely\s+)*covered"
+    r"(?!\s+(?:in|with|by\s+(?!(?:the\s+|your\s+)?(?:warranty|guarantee)\b|us\b)))"
+    r"|(?:not|no longer)\s+covered"
+    r"(?!\s+(?:in|with|by\s+(?!(?:the\s+|your\s+)?(?:warranty|guarantee)\b|us\b)))"
+    r"|covered\s+(?:under|by)\s+(?:the\s+)?warranty"
+    r"|free\s+(?:of\s+charge|replacement|repair)"
+    r"|replace(?:ment|d)?\s+(?:free|at no cost)"
+    r"|we'?(?:ll| will)\s+(?:replace|repair|refund)"
+    r"|(?:full|partial)\s+refund|money back|at no charge|no charge to you"
+    r"|(?:eligible|entitled)\s+for\s+(?:a\s+)?(?:free|replacement|refund|repair)"
+    r"|warranty\s+(?:covers|does not cover|doesn'?t cover|has expired|is valid)"
+    r")\b",
     re.IGNORECASE,
 )
 

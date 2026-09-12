@@ -16,12 +16,14 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from scripts.eval_checks import (BASELINE, answered, asks_something, deadline_detected,
+from scripts.eval_checks import (BASELINE, answered, asks_something,
+                                 coverage_only_from_the_engine, deadline_detected,
                                  emitted, emotion_in, has_suggestions, longer_than,
                                  no_guard_hit, no_question_opener, not_mentions,
                                  picker_crosses_categories, mentions, no_picker,
-                                 no_invented_citations, promises_nothing_free,
-                                 reached_dealer_path, used, warranty_verdict)
+                                 no_invented_citations, no_sympathy_preamble,
+                                 promises_nothing_free, reached_dealer_path, used,
+                                 warranty_verdict, at_most)
 
 CASES: List[Dict[str, Any]] = [
     # ── S1: emotion, urgency, multimodal ──────────────────────────────────────
@@ -35,7 +37,7 @@ CASES: List[Dict[str, Any]] = [
             deadline_detected,
             no_question_opener,
             mentions("brush", "e-05", "e05"),
-            longer_than(400),
+            at_most(1200), no_sympathy_preamble,
             has_suggestions,
         ],
         "judge": True,
@@ -56,7 +58,7 @@ CASES: List[Dict[str, Any]] = [
         "checks": BASELINE + [
             # Repeating steps they have already done is the fastest way to lose them.
             not_mentions("clean the filter", "rinse the filter"),
-            longer_than(300),
+            at_most(1400),
         ],
         "judge": True,
     },
@@ -99,7 +101,7 @@ CASES: List[Dict[str, Any]] = [
             reached_dealer_path, used("check_warranty"),
             warranty_verdict("needs_proof", "covered_via_dealer"),
             mentions("dealer", "invoice", "reseller", "sinar"),
-            no_invented_citations, longer_than(400),
+            no_invented_citations, at_most(1600),
         ],
         "judge": True,
     },
@@ -107,9 +109,11 @@ CASES: List[Dict[str, Any]] = [
         "name": "S3_no_warranty_claim_without_engine",
         "scenario": "S3",
         "message": "is my order ANK-2026-11111 still under warranty?",
+        # ANK-2026-11111 is deliberately NOT in the orders table, so the correct
+        # answer says it cannot find the order and stops. That path never reaches the
+        # warranty engine, which is the point: no verdict is the honest verdict here.
         "checks": BASELINE + [
-            lambda t: None if ("check_warranty" in t.tools or "G1" in t.guard_hits)
-            else "coverage handled without the rule engine and without a guard hit",
+            coverage_only_from_the_engine,
             not_mentions("is covered", "we'll replace", "full refund"),
         ],
         "judge": False,
@@ -131,7 +135,7 @@ CASES: List[Dict[str, Any]] = [
         "name": "S3_refund_not_repair",
         "scenario": "S3",
         "message": "I don't want it fixed, I want my money back. It's been two weeks.",
-        "checks": BASELINE + [longer_than(250)],
+        "checks": BASELINE + [at_most(900)],
         "judge": True,
     },
 
@@ -167,7 +171,7 @@ CASES: List[Dict[str, Any]] = [
         "message": "my baby monitor keeps cutting out at night and I'm scared I won't "
                    "hear her. Please help.",
         "checks": BASELINE + [emotion_in("anxious", "frustrated", "confused", "calm"),
-                              longer_than(300)],
+                              at_most(1200), no_sympathy_preamble],
         "judge": True,
     },
 
@@ -197,7 +201,7 @@ CASES: List[Dict[str, Any]] = [
         "name": "multi_turn_followup",
         "scenario": "general",
         "message": "my earbuds keep disconnecting when I walk around. Only the left one.",
-        "checks": BASELINE + [longer_than(250), has_suggestions],
+        "checks": BASELINE + [at_most(1400), has_suggestions],
         "judge": True,
     },
 

@@ -35,7 +35,7 @@ from app.schemas.blocks import (Block, BlockType, DiagnosticStep, DiagnosticStep
                                 ProductCardItem, ProductGridPayload, ProductOption,
                                 TicketStatusPayload, WarrantyResultPayload,
                                 diagnostic_steps, human_handoff, product_picker,
-                                quick_replies, warranty_result)
+                                warranty_result)
 from app.services import products as product_svc
 from app.services import sessions as session_svc
 from app.sse import Event, SSEStream
@@ -1031,6 +1031,8 @@ def _blocks_from_state(state: AgentState) -> List[Block]:
             eta_minutes=8, channels=["chat", "email"],
             summary_preview=state.perception.summary)))
 
-    if state.suggestions:
-        blocks.append(quick_replies(state.suggestions))
+    # Suggestions travel on their own `suggestions` event, which the UI renders under
+    # "You might also ask". Adding a quick_replies BLOCK as well printed the same three
+    # chips twice, one group directly above the other — the kind of thing that reads as
+    # a broken page rather than a duplicated payload.
     return blocks

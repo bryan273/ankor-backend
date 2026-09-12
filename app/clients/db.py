@@ -64,30 +64,66 @@ async def connection() -> AsyncIterator[Any]:
         yield conn
 
 
+async def _with_retry(run, what: str, attempts: int = 3):
+    """Run a query, retrying when the connection dies underneath it.
+
+    Checking a connection on checkout catches one that was already dead; it cannot help
+    one that dies mid-query, which is what Supabase's pooler does to a long-running job
+    that spends minutes between writes. A crawl that had fetched hundreds of pages lost
+    all of them to a single dropped socket.
+
+    Only connection-level failures retry. A syntax error or a constraint violation is
+    deterministic, and retrying it twice more just makes the log worse.
+    """
+    import asyncio
+
+    from psycopg import OperationalError
+
+    last: Optional[Exception] = None
+    for attempt in range(attempts):
+        try:
+            return await run()
+        except OperationalError as e:
+            last = e
+            log.warning("db.connection_lost", op=what, attempt=attempt, error=str(e)[:120])
+            if attempt < attempts - 1:
+                await asyncio.sleep(0.5 * (attempt + 1))
+    raise last  # type: ignore[misc]
+
+
 async def fetch(sql: str, params: Sequence[Any] = ()) -> List[Dict[str, Any]]:
-    async with connection() as conn, conn.cursor() as cur:
-        await cur.execute(sql, params)
-        return await cur.fetchall()
+    async def run():
+        async with connection() as conn, conn.cursor() as cur:
+            await cur.execute(sql, params)
+            return await cur.fetchall()
+    return await _with_retry(run, "fetch")
 
 
 async def fetch_one(sql: str, params: Sequence[Any] = ()) -> Optional[Dict[str, Any]]:
-    async with connection() as conn, conn.cursor() as cur:
-        await cur.execute(sql, params)
-        return await cur.fetchone()
+    async def run():
+        async with connection() as conn, conn.cursor() as cur:
+            await cur.execute(sql, params)
+            return await cur.fetchone()
+    return await _with_retry(run, "fetch_one")
 
 
 async def execute(sql: str, params: Sequence[Any] = ()) -> int:
-    async with connection() as conn, conn.cursor() as cur:
-        await cur.execute(sql, params)
-        return cur.rowcount
+    async def run():
+        async with connection() as conn, conn.cursor() as cur:
+            await cur.execute(sql, params)
+            return cur.rowcount
+    return await _with_retry(run, "execute")
 
 
 async def execute_many(sql: str, rows: Sequence[Sequence[Any]]) -> int:
     if not rows:
         return 0
-    async with connection() as conn, conn.cursor() as cur:
-        await cur.executemany(sql, rows)
-        return cur.rowcount
+
+    async def run():
+        async with connection() as conn, conn.cursor() as cur:
+            await cur.executemany(sql, rows)
+            return cur.rowcount
+    return await _with_retry(run, "execute_many")
 
 
 async def ping() -> bool:
