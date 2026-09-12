@@ -76,6 +76,19 @@ class Settings(BaseSettings):
     supabase_secret_key: str = Field(default="", alias="SUPABASE_SECRET_KEY")
     supabase_db_password: str = Field(default="", alias="SUPABASE_DB_PASSWORD")
     supabase_region: str = Field(default="ap-northeast-1", alias="SUPABASE_REGION")
+    # Optional: point the pool at any Postgres (local dev, tests).
+    database_url: str = Field(default="", alias="DATABASE_URL")
+
+    # ── backend adapters: cloud <-> local, same interfaces (app/adapters) ────────
+    # Defaults reproduce the hosted stack; set these to run entirely on a laptop.
+    vector_backend: str = Field(default="pinecone", alias="VECTOR_BACKEND")
+    vector_sqlite_path: str = Field(
+        default=".localvec/anki_support.db", alias="VECTOR_SQLITE_PATH")
+    embed_provider: str = Field(default="gemini", alias="EMBED_PROVIDER")
+    embed_base_url: str = Field(
+        default="http://127.0.0.1:11434/v1", alias="EMBED_BASE_URL")
+    embed_api_key: str = Field(default="", alias="EMBED_API_KEY")
+    embed_local_model: str = Field(default="", alias="EMBED_LOCAL_MODEL")
 
     # ── optional ──────────────────────────────────────────────────────────────
     tavily_api_key: str = Field(default="", alias="TAVILY_API_KEY")
@@ -104,7 +117,13 @@ class Settings(BaseSettings):
     @property
     def db_url(self) -> Optional[str]:
         """Session-mode pooler. The direct `db.<ref>.supabase.co` host is IPv6-only
-        on this project and unreachable from most networks — measured, not assumed."""
+        on this project and unreachable from most networks — measured, not assumed.
+
+        DATABASE_URL overrides everything, so the same code runs against a local
+        Postgres for development and tests without touching the Supabase project.
+        """
+        if self.database_url.strip():
+            return self.database_url.strip()
         if not (self.supabase_ref and self.supabase_db_password):
             return None
         from urllib.parse import quote

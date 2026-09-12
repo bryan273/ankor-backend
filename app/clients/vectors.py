@@ -113,8 +113,12 @@ class VectorStore:
 _store: Optional[VectorStore] = None
 
 
-def get_vectors() -> VectorStore:
+def get_vectors():
+    """Backend-agnostic: Pinecone by default, or the local sqlite-vec store when
+    VECTOR_BACKEND=sqlite. Callers keep using the VectorStore duck-type."""
     global _store
     if _store is None:
-        _store = VectorStore()
+        from app.adapters import get_vector_store
+
+        _store = get_vector_store()
     return _store
