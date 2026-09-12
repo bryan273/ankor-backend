@@ -31,6 +31,13 @@ def get_vector_store() -> Any:
         from app.clients.vectors import VectorStore
 
         return VectorStore()
+    if backend in ("pgvector", "postgres"):
+        from app.adapters.pg_vector import PgVectorStore
+
+        dsn = settings.database_url or settings.db_url or ""
+        if not dsn:
+            raise ValueError("VECTOR_BACKEND=pgvector needs DATABASE_URL")
+        return PgVectorStore(dsn=dsn, dim=settings.embed_dim)
     if backend in ("sqlite", "sqlite_vec", "local"):
         from app.adapters.local_vector import SqliteVectorStore
 
@@ -54,6 +61,17 @@ def get_embedder() -> Any:
             api_key=settings.embed_api_key,
             dim=settings.embed_dim,
         )
+    if provider == "local":
+        # "local" = the quality local default when no model is named: a 1024-d
+        # Matryoshka-friendly model on-device. bge-m3 is NOT in fastembed, so the
+        # 1024-d local choice is bge-large; serve bge-m3 through openai_compat
+        # (Ollama) if you want multilingual + Matryoshka truncation.
+        from app.adapters.local_embed import FastEmbedEmbedder
+
+        return FastEmbedEmbedder(
+            model=settings.embed_local_model or "BAAI/bge-large-en-v1.5",
+            dim=settings.embed_dim or 1024,
+        )
     if provider in ("fastembed", "onnx"):
         from app.adapters.local_embed import FastEmbedEmbedder
 
@@ -67,7 +85,7 @@ def get_embedder() -> Any:
         return HashEmbedder(dim=settings.embed_dim)
     raise ValueError(
             f"unknown EMBED_PROVIDER={provider!r} "
-            "(gemini|openai_compat|fastembed|hash)")
+            "(gemini|openai_compat|fastembed|local|hash)")
 
 
 def describe_backends() -> Dict[str, Any]:
