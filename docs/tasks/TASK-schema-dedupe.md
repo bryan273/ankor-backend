@@ -27,12 +27,15 @@ you should say so in the log.
 |---|---|---|---|---|
 | `kb_articles` | 14,665 | **14,799** | +134 policy docs (`doc_type='policy'`, new vocabulary value) | KC agent |
 | `products` | 898 | **1,493** | **+595** rows (644 local SKUs total) | KC agent |
-| `product_docs` | 1,272 | **1,273** | +1 | not KC agent (see note) |
+| `product_docs` | 1,272 | **3,925** | **+2,653** (all-locale product sweep) | KC agent |
 | `error_codes` | 139 | 139 | unchanged | KC agent |
 
-Note on the `product_docs` +1: our push wrote nothing to that table; the row appeared during the
-session and is attributed to activity on your side. Flagging it rather than silently bundling it
-into our delta — if that was not you, it is worth a look.
+Note on the earlier `product_docs` +1: our first push wrote nothing to that table and the row
+appeared during the session, attributed to activity on your side. It is now subsumed by the
+all-locale sweep below.
+
+**All three tables your tasks depend on are now FROZEN** (see §2.2): `products` 1,493,
+`kb_articles` 14,799, `error_codes` 139.
 
 `kb_articles` `doc_type` distribution now: `article` 10,028 · `faq` 2,526 · `manual` 1,247 ·
 `troubleshooting` 864 · **`policy` 134** (sums to 14,799 ✓).
@@ -83,9 +86,32 @@ You can size the embedding job and stop wondering whether more content will arri
 - `kb_articles` has **zero** rows with an empty or ≤100-char body — all 14,799 rows carry usable
   text (avg 1,353–11,897 chars by `doc_type`). The `length(body) > 100` filter in your embed query
   therefore selects the whole table; nothing is silently dropped.
-- A full sweep of the remaining product long tail is running on two scrape VMs (694 candidates:
-  504 anker.com/eufy.com + 190 soundcore.com/ankersolix.com). Expect `product_docs` to grow by a
-  few hundred rows of `storefront_page` text, SKU-linked where the slug carries a SKU.
+- A full sweep of the product long tail is **COMPLETE**: **2,722 URLs written** (1,751
+  anker.com+eufy.com / 971 soundcore.com+ankersolix.com) across **all locales** — the previous
+  frontier had silently excluded `gr-en`/`uk`/`eu-es`/`nl`/`au`/`hu-en` variants (5,419 URLs) via a
+  hardcoded US-only filter. `product_docs` grew 1,272 → **3,925** (`storefront_page` 3,338,
+  `policy_page` 587), SKU-linked where the slug carries a SKU.
+- **Nothing further is queued to fetch.** Any further growth would require a new decision, not a
+  re-run.
+
+### 2.2 Can work start immediately? — yes, everything
+
+Status per table, so nothing is written against a moving target:
+
+| table | status | who touches it |
+|---|---|---|
+| `products` (1,493) | **frozen** | your §3.1 alias model and §3.4 backfills; our sweep never writes here |
+| `kb_articles` (14,799) | **frozen since 22:08:46** | §3.3 embedding — safe to run now, the set is closed |
+| `error_codes` (139) | **frozen** | §3.5 provenance fix |
+| `product_docs` (3,925) | **frozen as of this doc revision** | §3.2 surface decision + §3.6 prune — both now safe |
+
+So no task is blocked. Two ordering notes that are not blocking, just cheaper:
+
+1. Do **§3.6 (prune)** before **§3.3 (embed)** for `product_docs`: quota is spent at embed time, and
+   the noise count grew with the sweep (152 → **506**, see §3.6).
+2. The `products` dedupe numbers in §2 are **unchanged** (112 slug groups / 240 rows / 128 excess;
+   16 no-category / 46 no-price / 2 no-slug) — the sweep added storefront *pages*, not catalog rows,
+   so §3.1 can start against exactly the numbers quoted.
 
 
 ### 3.1 Canonical / alias model (highest value)
@@ -168,11 +194,13 @@ article's URL (plus `meaning` from the surrounding sentence when absent). Accept
 
 ### 3.6 `product_docs` carries noise — prune before embedding
 
-152 of 1,272 rows are ≤500-char marketing/checkout/test stubs (`policy_page` 137, `storefront_page`
-15): `/test`, `/synchrony-checkout`, `/buy-one-get-one-free`, `/trade-in-full`, `/e10-free-quote`,
-`/labor-day-sale-ads`. Embedding them spends quota to teach the agent about sale banners. Decide
-and record: prune by kind+length, or keep with an exclude flag — but do it *before* §3.3, because
-the cost is paid at embed time, not at query time.
+**506 of 3,925 rows** are ≤500-char marketing/checkout/test stubs (`storefront_page` 369,
+`policy_page` 137) — re-measured after the all-locale sweep (it was 152 of 1,272 before). Known
+members: `/test`, `/synchrony-checkout`, `/buy-one-get-one-free`, `/trade-in-full`,
+`/e10-free-quote`, `/labor-day-sale-ads`, `/hotdeals-bemzhao-test`. None has an empty
+`parsed_text`; they are short, not broken. Embedding them spends quota to teach the agent about
+sale banners. Decide and record: prune by kind+length, or keep with an exclude flag — but do it
+**before** §3.3, because the cost is paid at embed time, not at query time.
 
 ## 4. Git protocol (binding for both agents)
 
@@ -238,7 +266,9 @@ The git history — not this file — is what survives, which is exactly why §4
 | 2026-09-16 | kc-agent | `(the commit that adds this file)` (backend) | published this task doc to `docs/tasks/` | — | `git log` on `backend` |
 | 2026-09-16 | kc-agent | `(this commit)` (backend) | doc updated from the corpus-closure + data-quality findings: §2.1 closed corpus, §3.5 error_codes provenance, §3.6 product_docs noise, §1 drift note | evidence: 152 residue URLs all 404 with 200 controls on two networks; 73/139 codes without `source_url`; 152/1,272 docs ≤500 chars; 0 empty kb bodies | re-verified `embed_corpus.py` still has `BATCH=32` → `embed_many(concurrency=8)` and still 0 `product_docs` references, so §3.2/§3.3 remain open |
 | 2026-09-16 | kc-agent | `7975b40` (workspace) | residue recoverer + tiered extractor (T1 trafilatura / T2 `__NEXT_DATA__` / T3 Shopify JSON) | 152 candidates → all T4 404; 0 rows written | controls returned 200 from both networks; the first (wrong) control is documented in the commit |
-| 2026-09-16 | kc-agent | (running) | full product long-tail sweep on two VMs, split by host | 504 anker.com+eufy.com, 190 soundcore.com+ankersolix.com | sink batches landing in `product_docs` |
+| 2026-09-16 | kc-agent | (sweep, two VMs) | all-locale product sweep, split by host, launched from committed config | anker.com+eufy.com: exposed 7,508 / gaps 2,255 / **written 1,751** · soundcore+ankersolix: 3,545 / 1,152 / **971** · `product_docs` 1,272 → **3,925** | sink batches in `product_docs`; VM1 hit a native lxml crash at 480/504 and resumed from the DB, so nothing was lost |
+| 2026-09-16 | kc-agent | `2af549e` (workspace) | Colab flow made deterministic: config-driven locale policy, committed configs, `vm_sync`/`run_remote`; no on-the-fly authoring | `all_locales: true` + per-VM `products_hosts`; stale VM checkpoint auto-deleted (it had marked every sitemap target as visited → `todo=0`) | py_compile on all 4 scripts; 0 unsubstituted key placeholders in the sync payload |
+| 2026-09-16 | kc-agent | `(this commit)` (backend) | doc refreshed post-sweep: §1 counts, new §2.2 "can work start immediately", §3.6 noise 152 → 506 | re-verified `products` 1,493 · `kb_articles` 14,799 · `error_codes` 139 · dedupe numbers identical (112/240/128, 16/46/2) | psycopg against the live DB |
 
 **kc-agent notes for the push session (so nothing is re-derived):**
 
