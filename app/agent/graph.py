@@ -271,13 +271,41 @@ class Agent:
     async def _disambiguate(self, state: AgentState) -> bool:
         """Resolve the product, or pause and ask. Returns True if the turn paused."""
         mentions = state.perception.entities.product_mentions
-        if not mentions:
+        has_photo = bool(state.vlm_facts)
+        if not mentions and not has_photo:
             return False
         await self._step_start("identify")
-        resolved, candidates, how = await product_svc.disambiguate(
-            mentions, f"{state.user_message} {state.rewritten_query}",
-            customer_id=state.customer_id, vlm_facts=state.vlm_facts,
-        )
+
+        resolved: Optional[Dict[str, Any]] = None
+        candidates: List[Dict[str, Any]] = []
+        how = "no_match"
+        if mentions:
+            resolved, candidates, how = await product_svc.disambiguate(
+                mentions, f"{state.user_message} {state.rewritten_query}",
+                customer_id=state.customer_id, vlm_facts=state.vlm_facts,
+            )
+
+        # The photo is the fallback, and it has to cover two cases that look different
+        # and dead-end identically:
+        #
+        #   "this is my vacuum" + a picture  — no mention at all, so this step used to
+        #   be skipped outright and the customer got a paragraph saying we could not
+        #   tell, with no way forward.
+        #
+        #   a picture whose FINE PRINT got read as a model name. The vision pass is good
+        #   enough to pick "OmniHub 4.0" and "CoverStation" off the dock, perception
+        #   dutifully reports them as product mentions, and neither is a product — so the
+        #   catalog lookup returns nothing and a non-empty mentions list masked the photo
+        #   path entirely. Better vision made identification worse.
+        #
+        # Either way the photo still knows the category, and the customer's own orders
+        # usually know the rest.
+        if not resolved and len(candidates) < 2 and has_photo:
+            photo_candidates, photo_how = await product_svc.candidates_from_photo(
+                state.vlm_facts, state.customer_id)
+            if photo_candidates:
+                candidates, how = photo_candidates, photo_how
+                resolved = candidates[0] if len(candidates) == 1 else None
         state.candidates = candidates
 
         if resolved:
@@ -295,7 +323,10 @@ class Agent:
             return False
 
         if len(candidates) > 1:
-            question = await self._picker_question(mentions[0], candidates)
+            question = await self._picker_question(
+                "" if how.startswith("photo") else (mentions[0] if mentions else ""),
+                candidates,
+                where_to_look=_where_to_look(state.vlm_facts))
             options = [ProductOption(
                 sku=c["sku"], name=c["name"], brand=c["brand"],
                 image_url=c.get("hero_image"), price=c.get("price"),
@@ -326,18 +357,32 @@ class Agent:
                               mentions=mentions)
         return False
 
-    async def _picker_question(self, mention: str, candidates: List[Dict[str, Any]]) -> str:
+    async def _picker_question(self, mention: str, candidates: List[Dict[str, Any]],
+                               where_to_look: str = "") -> str:
+        """The one line above the picker.
+
+        Two different situations share this: a NAME that matches several products, and a
+        PHOTO that identified a category but no model. The photo case has no mention to
+        quote, and it has something better to offer — where the label actually is, so the
+        customer can settle it themselves in one go instead of guessing from thumbnails.
+        """
         options = ", ".join(f"{c['brand']} {c['name']}" for c in candidates[:4])
+        prompt = (prompts.PICKER_FROM_PHOTO.format(options=options,
+                                                   where_to_look=where_to_look
+                                                   or "on a sticker on the device")
+                  if not mention else
+                  prompts.PICKER_QUESTION.format(mention=mention, options=options))
         try:
             data, usage = await self.llm.json_complete(
-                [{"role": "user", "content": prompts.PICKER_QUESTION.format(
-                    mention=mention, options=options)}],
-                max_tokens=900, default={},
-            )
+                [{"role": "user", "content": prompt}], max_tokens=900, default={})
             if data.get("question"):
                 return data["question"]
         except Exception as e:  # noqa: BLE001
             log.warning("agent.picker_question_failed", error=str(e)[:120])
+        if not mention:
+            return ("I can see the type of device, but not which model — the model number "
+                    f"is usually {where_to_look or 'on a sticker on the device'}. "
+                    "Is it one of these?")
         return (f"Quick check — \"{mention}\" is used for more than one of our products. "
                 "Which of these is yours?")
 
@@ -810,7 +855,18 @@ def _how_phrase(how: str) -> str:
         "photo": "your photo",
         "vector": "the closest match in the catalog",
         "user_pick": "what you picked",
+        "photo_and_purchase_history": "your photo and what you've ordered",
+        "photo_category": "your photo",
     }.get(how, "what you told me")
+
+
+def _where_to_look(vlm_facts) -> str:
+    """Where the model number lives on the thing in the photo, per the vision pass."""
+    for facts in vlm_facts or []:
+        hint = ((facts.get("detected") or {}).get("where_to_look") or "").strip()
+        if hint:
+            return hint
+    return ""
 
 
 def _option_hint(c: Dict[str, Any]) -> str:

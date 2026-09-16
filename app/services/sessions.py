@@ -198,3 +198,64 @@ async def save_guard_hits(message_id: str, hits: List[Dict[str, Any]]) -> None:
         [(message_id, h["rule_id"], h.get("detail", ""), h.get("repaired", False))
          for h in hits],
     )
+
+
+async def list_sessions(limit: int = 40, unresolved_only: bool = False) -> List[Dict[str, Any]]:
+    """The agent console's inbox: one row per conversation, newest activity first.
+
+    Every turn has always been written to Postgres — messages, blocks, tool traces,
+    guard hits — but nothing could ask for the *list*, so the console could only ever
+    show the conversation happening in front of it and a page refresh looked like data
+    loss. One support agent handles many customers at once; this is the query that makes
+    that possible.
+
+    The columns are the ones an agent triages on, not everything we store: who, what
+    they last said, how they sounded, whether the conversation is sitting waiting on a
+    reply, and whether a ticket already exists.
+    """
+    rows = await db.fetch(
+        """
+        with last_msg as (
+            select distinct on (m.session_id)
+                   m.session_id, m.text, m.role, m.emotion, m.intent, m.created_at
+            from messages m
+            order by m.session_id, m.created_at desc
+        ),
+        counts as (
+            select session_id, count(*) as n from messages group by session_id
+        )
+        select s.id::text            as session_id,
+               s.resolved_sku,
+               s.updated_at,
+               c.email               as customer_email,
+               c.name                as customer_name,
+               p.name                as product_name,
+               lm.text               as last_text,
+               lm.role               as last_role,
+               lm.emotion            as last_emotion,
+               lm.intent             as last_intent,
+               lm.created_at         as last_at,
+               coalesce(cn.n, 0)     as message_count,
+               t.ticket_no,
+               t.status              as ticket_status,
+               -- A turn that paused on a block is a customer sitting and waiting. The
+               -- checkpoint lives in sessions.meta rather than its own table.
+               (s.meta ? 'checkpoint') as awaiting
+        from sessions s
+        left join customers c on c.id = s.customer_id
+        left join products  p on p.sku = s.resolved_sku
+        left join last_msg lm on lm.session_id = s.id
+        left join counts   cn on cn.session_id = s.id
+        left join lateral (
+            select ticket_no, status from tickets tk
+            where tk.session_id = s.id order by tk.created_at desc limit 1
+        ) t on true
+        where cn.n > 0
+        order by coalesce(lm.created_at, s.updated_at) desc
+        limit %s
+        """,
+        (limit,),
+    )
+    if unresolved_only:
+        rows = [r for r in rows if r.get("ticket_status") != "resolved"]
+    return rows

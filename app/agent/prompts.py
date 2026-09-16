@@ -221,6 +221,12 @@ Return ONLY JSON:
   "detected": {
     "brand": "anker|eufy|soundcore|unknown",
     "form_factor": "robot_vacuum|breast_pump|charger|power_bank|power_station|audio|security_camera|projector|unknown",
+    "model_number": "the model or SKU if it is actually PRINTED in the photo, else empty",
+    "model_number_visible": false,
+    "where_to_look": "if no model number is visible, where on THIS type of device the \
+label usually is, in one short phrase a customer can act on",
+    "distinguishing_features": ["specific visible details that separate this unit from \
+similar models"],
     "error_code": "the code shown, or empty",
     "damage_class": "defect|physical_damage|wear|unknown",
     "confidence": 0.0
@@ -232,7 +238,22 @@ Read error codes and screen text exactly as printed — a misread digit sends th
 down the wrong repair. `damage_class` is `physical_damage` for cracks, dents and liquid \
 marks, `wear` for a dirty filter or a frayed cable, `defect` when the device looks intact \
 but reports a fault. Add safety flags for swelling, burn marks, melting, smoke or exposed \
-wiring. Say `unknown` rather than guessing a brand from a shape."""
+wiring. Say `unknown` rather than guessing a brand from a shape.
+
+About the model number, which is the thing support most needs and most often cannot get:
+
+- `model_number` is ONLY for characters you can actually read in the image. These \
+products look almost identical to each other across a whole range, so a model inferred \
+from the silhouette is a guess wearing a fact's clothing, and the customer will act on it.
+- `model_number_visible` is true only when you read it off the device.
+- `where_to_look` is the useful thing when it is not visible. Robot vacuums print it on \
+a sticker on the underside of the robot and often on the back of the dock; power stations \
+on a plate on the base or rear panel; chargers and power banks on the body in fine print; \
+earbuds inside the lid of the charging case.
+- `distinguishing_features` earns its place by being SPECIFIC and visible. "Black robot \
+vacuum" separates nothing. "Dock has a clear water tank on the right", "raised LiDAR \
+turret on top", "white body", "screen on the dock", "two round buttons" — those narrow a \
+range down. List what you can actually see, and nothing you cannot."""
 
 
 # ── image-aware disambiguation question ───────────────────────────────────────
@@ -242,5 +263,15 @@ product. Write ONE short friendly question asking which one they have. Mention w
 distinguishes them in a few words. No preamble.
 
 The products: {options}
+
+Return ONLY JSON: {{"question": "..."}}"""
+
+
+PICKER_FROM_PHOTO = """A customer sent a photo of their device. You can tell what KIND of product it is but the model number is not visible in the picture, and these models look nearly identical to each other.
+
+Write ONE short friendly line that does two things: says you can see the type but not the exact model, and tells them where the model number is so they can settle it themselves. Then the app shows them the options to tap, so do NOT list the products in your line.
+
+Where the number usually is: {where_to_look}
+The options being shown: {options}
 
 Return ONLY JSON: {{"question": "..."}}"""

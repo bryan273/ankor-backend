@@ -246,6 +246,21 @@ async def assist(session_id: str, _: str = Depends(require_api_key)) -> Dict[str
     return await assist_svc.build_briefing(session_id)
 
 
+# Declared before `/sessions/{session_id}`, or FastAPI reads the bare path as a session
+# id and answers 404.
+@router.get("/sessions")
+async def list_sessions(limit: int = 40, open_only: bool = False,
+                        _: str = Depends(require_api_key)) -> Dict[str, Any]:
+    """The agent console's inbox — every conversation, newest activity first.
+
+    One support agent handles many customers at once, which needs a list of who is
+    waiting. Everything here was already in Postgres; nothing could ask for it.
+    """
+    rows = await session_svc.list_sessions(limit=min(limit, 100),
+                                           unresolved_only=open_only)
+    return {"count": len(rows), "sessions": rows}
+
+
 @router.get("/sessions/{session_id}")
 async def get_session(session_id: str, _: str = Depends(require_api_key)) -> Dict[str, Any]:
     session = await session_svc.get_session(session_id)

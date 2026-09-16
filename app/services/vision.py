@@ -57,9 +57,19 @@ async def describe_image(raw: bytes, mime: str,
     return {
         "caption": str(data.get("caption") or "")[:400],
         "ocr_text": str(data.get("ocr_text") or "")[:2000],
+        # This rebuilds `detected` field by field rather than passing the model's object
+        # through, so that a hallucinated extra key cannot reach the rest of the system.
+        # The cost of that is real: a field added to VLM_SYSTEM and not added here is
+        # extracted correctly, returned correctly, and then silently discarded here. If
+        # you add to the prompt, add to this list.
         "detected": {
             "brand": (detected.get("brand") or "unknown"),
             "form_factor": (detected.get("form_factor") or "unknown"),
+            "model_number": str(detected.get("model_number") or "")[:60],
+            "model_number_visible": bool(detected.get("model_number_visible")),
+            "where_to_look": str(detected.get("where_to_look") or "")[:160],
+            "distinguishing_features": [
+                str(f)[:80] for f in (detected.get("distinguishing_features") or [])][:6],
             "error_code": (detected.get("error_code") or ""),
             "damage_class": (detected.get("damage_class") or "unknown"),
             "confidence": float(detected.get("confidence") or 0.0),

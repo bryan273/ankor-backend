@@ -321,6 +321,88 @@ def score_by_photo(candidates: List[Dict[str, Any]],
     return None
 
 
+# What the vision pass calls a thing, and what the catalog calls it. Mostly identical,
+# which is why this was never written down — until a photo-only message needed to turn
+# "robot_vacuum" into a candidate list and found nothing to turn it with.
+FORM_FACTOR_TO_CATEGORY = {
+    "robot_vacuum": "robot_vacuum", "stick_vacuum": "stick_vacuum",
+    "breast_pump": "breast_pump", "baby_monitor": "baby_monitor",
+    "charger": "charger", "power_bank": "power_bank",
+    "power_station": "power_station", "audio": "audio",
+    "security_camera": "security_camera", "projector": "projector",
+    "smart_lock": "smart_lock", "webcam": "webcam",
+}
+
+
+async def candidates_from_photo(
+    vlm_facts: Optional[List[Dict[str, Any]]], customer_id: Optional[str] = None,
+    limit: int = 4,
+) -> Tuple[List[Dict[str, Any]], str]:
+    """Candidate products for a photo that named no model, and how they were found.
+
+    A customer who photographs their vacuum and says "this is my vacuum" gives us a
+    category and nothing else, because the model number is on a sticker underneath. No
+    amount of image similarity recovers a number that is not in the pixels — and these
+    devices are near-identical across a range, so a visual match returns a confident
+    WRONG model, which is worse than admitting we cannot tell.
+
+    What actually narrows it is what the customer already told us elsewhere:
+
+    1. **What they bought.** If we know who they are, their own devices in that category
+       are the answer, and usually there is only one.
+    2. **Failing that, the catalog** for that category — offered as something to tap,
+       not as a question to type an answer to.
+    """
+    for facts in vlm_facts or []:
+        detected = facts.get("detected") or {}
+        form = (detected.get("form_factor") or "").strip().lower()
+        category = FORM_FACTOR_TO_CATEGORY.get(form)
+        if not category:
+            continue
+
+        if customer_id:
+            owned = await db.fetch(
+                """
+                select distinct p.id::text as product_id, p.sku, p.name, p.brand,
+                       p.category, p.price, p.hero_image
+                from orders o
+                join order_items oi on oi.order_id = o.id
+                join products p on p.id = oi.product_id
+                where o.customer_id = %s and p.category = %s
+                order by p.name
+                limit %s
+                """,
+                (customer_id, category, limit),
+            )
+            if owned:
+                return owned, "photo_and_purchase_history"
+
+        brand = (detected.get("brand") or "").strip().lower()
+        # Bundles last. The catalog is full of "X10 Pro Omni + Dust Bags (6-Pack)" and
+        # "SoloCam S340 + eufy X10 Pro Omni", and sorting by price put three of those in
+        # a four-option picker — nobody looking at their own vacuum thinks "mine is the
+        # one that came with six dust bags". The device itself is what they recognise,
+        # and its bundles resolve to the same support answer anyway.
+        rows = await db.fetch(
+            """
+            select p.id::text as product_id, p.sku, p.name, p.brand, p.category,
+                   p.price, p.hero_image
+            from products p
+            where p.category = %s
+              and p.hero_image is not null
+              and p.status <> 'discontinued'
+              and (%s = '' or lower(p.brand) = %s)
+            order by (p.name like '%%+%%' or p.sku ilike 'BUNDLE-%%'),
+                     p.price desc nulls last, p.name
+            limit %s
+            """,
+            (category, brand, brand, limit),
+        )
+        if rows:
+            return rows, "photo_category"
+    return [], "no_match"
+
+
 async def disambiguate(
     mentions: List[str], text: str, customer_id: Optional[str] = None,
     vlm_facts: Optional[List[Dict[str, Any]]] = None,
