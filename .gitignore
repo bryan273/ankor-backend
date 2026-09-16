@@ -38,3 +38,6 @@ Thumbs.db
 data/
 logs/
 *.log
+
+# local vector index (regenerable)
+.localvec/

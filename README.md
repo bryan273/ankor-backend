@@ -3,6 +3,12 @@
 > Anker 首届黑客松挑战赛 · 赛道 04 智能服务（真正听懂，真正解决）
 > **Track 4 — Intelligent Services.** An after-sales support agent that reads the person, not just the sentence.
 
+**⚠️ Active task (temporary):** [`docs/tasks/TASK-schema-dedupe.md`](docs/tasks/TASK-schema-dedupe.md) —
+schema/code alignment + product dedupe, owner: Bryan. Read it before touching `products`,
+`dealers`, `warranty_policies` or the embed pipeline. It carries the binding git protocol:
+every action is a commit, and every commit adds a row to that document's append-only handoff
+log. **Remove this pointer together with that document** when the task closes out.
+
 FastAPI + a hand-rolled ReAct loop over `gpt-5.6-terra`, grounded in a real crawl of Anker's product catalog and support knowledge base. Frontend lives in [`anker-hackathon-frontend`](https://github.com/tkc88888888/anker-hackathon-frontend).
 
 ---

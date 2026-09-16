@@ -105,8 +105,12 @@ class Embedder:
 _embedder: Optional[Embedder] = None
 
 
-def get_embedder() -> Embedder:
+def get_embedder():
+    """Backend-agnostic: Gemini by default, or a local OpenAI-compatible embedder when
+    EMBED_PROVIDER=openai_compat (Ollama / llama.cpp / vLLM / MLX)."""
     global _embedder
     if _embedder is None:
-        _embedder = Embedder()
+        from app.adapters import get_embedder as _pick
+
+        _embedder = _pick()
     return _embedder
