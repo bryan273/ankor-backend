@@ -65,6 +65,7 @@ class SSEStream:
         self._terminated = False
         self._heartbeat = heartbeat
         self.emitted: List[str] = []  # for tests and the trace drawer
+        self.reasoning: List[Dict[str, str]] = []  # persisted with the turn
 
     # ── emit ──────────────────────────────────────────────────────────────────
     async def emit(self, event: Event, data: Optional[Dict[str, Any]] = None) -> None:
@@ -127,6 +128,11 @@ class SSEStream:
             await self._queue.put((Event.STAGE_COMPLETE.value, {"stage_id": stage_id, "ms": ms}))
 
     async def thinking(self, stage_id: str, delta: str) -> None:
+        # Recorded as well as streamed. The reasoning trail used to exist only as it
+        # flew past: a support agent opening the conversation an hour later — exactly
+        # the person who has to explain why the system said what it said — got an empty
+        # panel, because nothing had ever written it down.
+        self.reasoning.append({"stage_id": stage_id, "text": delta})
         await self.emit(Event.THINKING_DELTA, {"stage_id": stage_id, "delta": delta})
 
     async def content(self, delta: str) -> None:

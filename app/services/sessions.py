@@ -65,17 +65,38 @@ async def add_message(
     session_id: str, role: str, text: str, *, emotion: Optional[str] = None,
     intensity: Optional[float] = None, intent: Optional[str] = None,
     urgency: Optional[Dict[str, Any]] = None,
+    reasoning: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     row = await db.fetch_one(
         """
-        insert into messages (session_id, role, text, emotion, intensity, intent, urgency)
-        values (%s, %s, %s, %s, %s, %s, %s)
+        insert into messages (session_id, role, text, emotion, intensity, intent, urgency,
+                              reasoning)
+        values (%s, %s, %s, %s, %s, %s, %s, %s)
         returning id::text as id
         """,
         (session_id, role, text, emotion, intensity, intent,
-         json.dumps(urgency) if urgency else None),
+         json.dumps(urgency) if urgency else None,
+         json.dumps(reasoning or [], default=str)),
     )
     return row["id"]
+
+
+async def link_attachments(message_id: str, attachment_ids: List[str],
+                           session_id: Optional[str] = None) -> None:
+    """Bind uploaded photos to the message they were sent with.
+
+    Uploads happen before the message exists — the vision pass runs while the customer is
+    still typing — so the row starts with no message and no session. Without this the
+    photo is orphaned: the customer sees it in their own bubble because the browser still
+    holds it, and the support agent opening that conversation later sees nothing at all.
+    """
+    if not attachment_ids:
+        return
+    await db.execute(
+        "update attachments set message_id = %s, session_id = coalesce(session_id, %s) "
+        "where id::text = any(%s) and message_id is null",
+        (message_id, session_id, attachment_ids),
+    )
 
 
 async def history(session_id: str, limit: int = 12) -> List[Dict[str, str]]:
@@ -90,7 +111,8 @@ async def history(session_id: str, limit: int = 12) -> List[Dict[str, str]]:
 async def messages_with_blocks(session_id: str, limit: int = 50) -> List[Dict[str, Any]]:
     rows = await db.fetch(
         """
-        select m.id::text as message_id, m.role, m.text, m.emotion, m.intent, m.created_at
+        select m.id::text as message_id, m.role, m.text, m.emotion, m.intent,
+               m.reasoning, m.created_at
         from messages m where m.session_id = %s order by m.created_at limit %s
         """,
         (session_id, limit),
@@ -110,8 +132,62 @@ async def messages_with_blocks(session_id: str, limit: int = 50) -> List[Dict[st
     by_message: Dict[str, List[Dict[str, Any]]] = {}
     for b in blocks:
         by_message.setdefault(b["message_id"], []).append(b)
+    attachments = await db.fetch(
+        """
+        select a.message_id::text as message_id, a.id::text as attachment_id,
+               a.mime, a.vlm_facts
+        from attachments a
+        join messages m on m.id = a.message_id
+        where m.session_id = %s order by a.created_at
+        """,
+        (session_id,),
+    )
+    by_att: Dict[str, List[Dict[str, Any]]] = {}
+    for a in attachments:
+        facts = a["vlm_facts"]
+        if isinstance(facts, str):
+            facts = json.loads(facts)
+        by_att.setdefault(a["message_id"], []).append({
+            "id": a["attachment_id"],
+            "url": f"/api/v1/attachments/{a['attachment_id']}/raw",
+            "caption": ((facts or {}).get("caption") or "")[:200],
+        })
+    # The tool trail was already being written on every turn and never read back. It is
+    # the other half of "why did it say that", so it comes back with the transcript.
+    traces = await db.fetch(
+        """
+        select tt.message_id::text as message_id, tt.tool, tt.ok, tt.ms
+        from tool_traces tt join messages m on m.id = tt.message_id
+        where m.session_id = %s order by tt.created_at
+        """,
+        (session_id,),
+    )
+    by_tool: Dict[str, List[Dict[str, Any]]] = {}
+    for t in traces:
+        by_tool.setdefault(t["message_id"], []).append(
+            {"tool": t["tool"], "ok": t["ok"], "ms": t["ms"]})
+
+    guards = await db.fetch(
+        """
+        select gh.message_id::text as message_id, gh.rule_id
+        from guard_hits gh join messages m on m.id = gh.message_id
+        where m.session_id = %s order by gh.id
+        """,
+        (session_id,),
+    )
+    by_guard: Dict[str, List[str]] = {}
+    for g in guards:
+        by_guard.setdefault(g["message_id"], []).append(g["rule_id"])
+
     for r in rows:
         r["blocks"] = by_message.get(r["message_id"], [])
+        r["attachments"] = by_att.get(r["message_id"], [])
+        reasoning = r.get("reasoning")
+        if isinstance(reasoning, str):
+            reasoning = json.loads(reasoning)
+        r["reasoning"] = reasoning or []
+        r["tools"] = by_tool.get(r["message_id"], [])
+        r["guard_hits"] = by_guard.get(r["message_id"], [])
     return rows
 
 

@@ -4,12 +4,14 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, File, Form, UploadFile
-from fastapi.responses import FileResponse
+from fastapi import Response
+from fastapi.responses import RedirectResponse
 
 from app.clients import db
 from app.deps import require_api_key
 from app.errors import BadRequest, NotFound, VoiceDisabled
 from app.config import settings
+from app.clients import storage
 from app.services import vision
 
 router = APIRouter(tags=["attachments"])
@@ -35,16 +37,37 @@ async def upload(file: UploadFile = File(...), session_id: Optional[str] = Form(
 
 
 @router.get("/attachments/{attachment_id}/raw")
-async def raw(attachment_id: str) -> FileResponse:
+async def raw(attachment_id: str, size: str = "full") -> Response:
+    """Serve the image, from Supabase Storage or from disk.
+
+    Deliberately unauthenticated so an `<img src>` can load it: the id is a UUID, the
+    route is read-only, and the alternative is signed URLs the frontend would have to
+    refresh mid-conversation. The bucket itself stays private, so this endpoint is the
+    only way in.
+    """
     row = await db.fetch_one(
-        "select storage_path, mime from attachments where id::text = %s", (attachment_id,))
+        "select storage_path, thumb_path, mime from attachments where id::text = %s",
+        (attachment_id,))
     if not row:
         raise NotFound("no such attachment", {"attachment_id": attachment_id})
-    import pathlib
-    path = pathlib.Path(row["storage_path"])
-    if not path.exists():
+    # `?size=thumb` for previews. The original is a phone photo drawn at 56 px, so the
+    # small copy is ~1% of the bytes; falling back to the original keeps rows that
+    # predate thumbnails working.
+    wanted = row["thumb_path"] if (size == "thumb" and row["thumb_path"]) else row["storage_path"]
+    # Big files get a signed redirect so the browser pulls them straight from the bucket.
+    # Thumbnails do NOT: signing is a round trip of its own, and for 14 KB that round
+    # trip IS the latency — two hops to deliver less than one packet's worth of image.
+    # Relaying the small copy is measurably faster than being clever about it.
+    if wanted is not row["thumb_path"]:
+        direct = await storage.signed_url(wanted)
+        if direct:
+            return RedirectResponse(direct, status_code=307)
+
+    raw_bytes = await vision.read_bytes(wanted)
+    if raw_bytes is None:
         raise NotFound("attachment file is gone", {"attachment_id": attachment_id})
-    return FileResponse(path, media_type=row["mime"] or "image/jpeg")
+    return Response(content=raw_bytes, media_type=row["mime"] or "image/jpeg",
+                    headers={"Cache-Control": "private, max-age=3600"})
 
 
 @router.post("/voice/transcribe")

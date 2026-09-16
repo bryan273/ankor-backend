@@ -248,8 +248,13 @@ create table if not exists attachments (
   mime         text,
   bytes        int,
   vlm_facts    jsonb default '{}'::jsonb,           -- caption, ocr_text, detected{}, safety_flags[]
+  -- Linked once the turn it belongs to exists. An upload happens BEFORE the message is
+  -- sent, so this is null at insert and filled in when the turn is persisted; without
+  -- it the support console has no way to show the agent what the customer sent.
+  message_id   uuid references messages(id) on delete set null,
   created_at   timestamptz default now()
 );
+create index if not exists attachments_message_idx on attachments (message_id);
 
 create table if not exists tool_traces (
   id          uuid primary key default gen_random_uuid(),

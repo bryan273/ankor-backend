@@ -154,14 +154,29 @@ class Agent:
     # ── nodes ─────────────────────────────────────────────────────────────────
 
     async def _ingest(self, state: AgentState) -> None:
-        """Attachments are processed at upload time, so this reads facts rather than
-        computing them — the turn should not pay for vision twice."""
-        if not state.attachment_ids:
+        """Read the photo facts. Computed at upload time, so this never pays for vision
+        twice — and it reads the whole CONVERSATION's photos, not just this turn's.
+
+        A customer sends a picture, then asks three follow-up questions about it. Only
+        the first of those turns carries an attachment, so scoping this to the turn made
+        the agent forget the device it had been looking at seconds earlier. It also made
+        a reopened session blind to everything the customer had ever sent.
+        """
+        from app.services.vision import get_facts, session_facts
+
+        facts = await get_facts(state.attachment_ids) if state.attachment_ids else []
+        new_ids = {f.get("attachment_id") for f in facts}
+        earlier = [f for f in await session_facts(state.session_id)
+                   if f.get("attachment_id") not in new_ids]
+        state.vlm_facts = earlier + facts
+        if not state.vlm_facts:
+            return
+        # The stage only narrates photos that arrived on THIS turn: "I can see…" about a
+        # picture from four turns ago reads as the system losing track of the thread.
+        if not facts:
+            await self._step_done("photo", photos=len(earlier), from_earlier_turns=True)
             return
         await self._step_start("photo")
-        from app.services.vision import get_facts
-        facts = await get_facts(state.attachment_ids)
-        state.vlm_facts = facts
         for f in facts:
             caption = f.get("caption", "")
             if caption:
@@ -798,6 +813,36 @@ class Agent:
                             "in passing so they can correct you)")
         if state.customer_email:
             bits.append(f"Account: {state.customer_email}")
+
+        # The photo. The ReAct planner was given this and the COMPOSER was not, so every
+        # turn with an attachment was written blind — the customer sent a picture of a
+        # USB-C cable, the vision pass described it correctly, and the reply said "I
+        # can't see your device from here". That sentence was not a hallucination; it was
+        # an accurate report of a context nobody had put the photo into.
+        for facts in state.vlm_facts or []:
+            detected = facts.get("detected") or {}
+            caption = (facts.get("caption") or "").strip()
+            if caption:
+                bits.append(f"They sent a photo. It shows: {caption}")
+            seen = [f"{k}: {detected[k]}" for k in ("brand", "form_factor", "damage_class")
+                    if detected.get(k) and detected[k] != "unknown"]
+            if seen:
+                bits.append("Vision read — " + ", ".join(seen) + ".")
+            if (facts.get("ocr_text") or "").strip():
+                bits.append(f"Text visible in the photo: \"{facts['ocr_text'][:200]}\"")
+            if detected.get("error_code"):
+                bits.append(f"Error code in the photo: {detected['error_code']}")
+            # Saying this plainly is what keeps the reply honest without making it blind:
+            # it CAN describe what it sees, it just cannot read a number that is not there.
+            if not detected.get("model_number_visible"):
+                where = detected.get("where_to_look") or ""
+                bits.append(
+                    "No model number is readable in the photo, so do NOT guess one — "
+                    "describe what you can see and ask them to check the label"
+                    + (f" ({where})." if where else "."))
+            elif detected.get("model_number"):
+                bits.append(f"Model number read off the photo: {detected['model_number']}")
+
         p = state.perception
         bits.append(f"They sound {p.emotion.value}.")
         if p.urgency.has_deadline:

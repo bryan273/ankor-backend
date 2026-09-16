@@ -20,3 +20,4 @@ pytest-asyncio>=0.24
 #   pinecone / google-genai — both APIs are called over httpx directly; the SDKs added
 #     dependencies without adding capability.
 #   pymupdf, tenacity, respx — planned, never used.
+pillow>=11.0                   # downscales photos for the vision call and for previews

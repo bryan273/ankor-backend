@@ -62,7 +62,7 @@ async def _run_and_finish(agent: Agent, state: AgentState, stream: SSEStream,
         await agent.run(state)
     except Exception:  # noqa: BLE001 — agent.run already emitted `error`
         bump("errors")
-        await _persist(state, agent, failed=True)
+        await _persist(state, agent, failed=True, stream=stream)
         return
     finally:
         slot.release()
@@ -76,7 +76,7 @@ async def _resume_and_finish(agent: Agent, state: AgentState, stream: SSEStream,
         await agent.resume(state, action_id, value)
     except Exception:  # noqa: BLE001
         bump("errors")
-        await _persist(state, agent, failed=True)
+        await _persist(state, agent, failed=True, stream=stream)
         return
     finally:
         slot.release()
@@ -84,7 +84,7 @@ async def _resume_and_finish(agent: Agent, state: AgentState, stream: SSEStream,
 
 
 async def _finish(state: AgentState, agent: Agent, stream: SSEStream) -> None:
-    await _persist(state, agent)
+    await _persist(state, agent, stream=stream)
     await stream.emit(Event.USAGE, {
         "input": state.input_tokens, "output": state.output_tokens,
         "total": state.input_tokens + state.output_tokens,
@@ -105,7 +105,8 @@ async def _finish(state: AgentState, agent: Agent, stream: SSEStream) -> None:
     bump("guard_hits", len(state.guard_hits))
 
 
-async def _persist(state: AgentState, agent: Agent, failed: bool = False) -> None:
+async def _persist(state: AgentState, agent: Agent, failed: bool = False,
+                   stream: Optional[SSEStream] = None) -> None:
     """Writes are best-effort: a database hiccup must not turn a good answer into an
     error the customer sees."""
     try:
@@ -116,6 +117,7 @@ async def _persist(state: AgentState, agent: Agent, failed: bool = False) -> Non
             intensity=state.perception.intensity,
             intent=state.perception.intent.value,
             urgency=state.perception.urgency.model_dump(),
+            reasoning=(stream.reasoning if stream else None),
         )
         for block in state.blocks:
             await session_svc.save_block(message_id, block.model_dump())
@@ -140,7 +142,11 @@ async def chat(req: ChatRequest, _: str = Depends(require_api_key)) -> Streaming
             req.session_id, req.client_context.customer_email, req.locale)
         session_id = session["session_id"]
 
-        await session_svc.add_message(session_id, "user", req.message)
+        user_message_id = await session_svc.add_message(session_id, "user", req.message)
+        # Bind the photos to the message they arrived with. They were uploaded before
+        # this message existed, so until now they belonged to nothing and the support
+        # console had no way to show the agent what the customer actually sent.
+        await session_svc.link_attachments(user_message_id, req.attachment_ids, session_id)
         history = await session_svc.history(session_id, limit=12)
         # `history` includes the message just written; the agent wants what came before it.
         history = history[:-1] if history else []
