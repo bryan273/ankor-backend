@@ -231,6 +231,32 @@ sale banners. Decide and record: prune by kind+length, or keep with an exclude f
 7. **Record what you chose NOT to do**, with the reason. Silent omissions are the main source of
    cross-agent miscommunication.
 
+## 4.1 Incident log — a merge reverted this document (read this before editing)
+
+On 2026-09-16 a merge on this repo took the **stale side of this file** and reverted verified
+numbers (a working copy that predated two revisions). The counts were restored in `c9c1f36`;
+nothing was lost, because every number in this doc is reproducible from the DB.
+
+Rules that come out of it, and they apply to both agents:
+
+1. **`git fetch` before you edit this file**, and re-read the section you are about to act on after
+   any merge. A stale working copy silently undoes someone else's verified work.
+2. **After any merge, re-measure before acting.** Every count here has a command in §8 — if the
+   number you read disagrees with the DB, the DB wins and the disagreement goes in §7.
+3. **Never resolve a conflict in this file by taking a whole side.** Merge the numbers (facts),
+   and keep both agents' log rows (history).
+
+## 4.2 In-flight on the other side (do not duplicate)
+
+- KC's agent is **done** with the corpus: scrape complete, all-locale sweep complete, tables frozen
+  (§2.2). No further writes to `kb_articles`, `products`, `error_codes` or `product_docs` are
+  planned unless a new decision requires it.
+- **Your own lane is vision**: commit `05cc88d` added `app/services/vision.py`,
+  `scripts/image_embed_probe.py` and photo-based product identification. That is not represented in
+  §3 — it is yours, and this document should not be read as a queue that excludes it. Worth noting
+  in §7 what that work needs (the `RKAPI_OPENAI_KEYS` lane currently 401s with no key set, which
+  may matter for image analysis).
+
 ## 5. Close-out
 
 When §3.1–§3.4 gates pass:
