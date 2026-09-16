@@ -60,7 +60,17 @@ def rest_pages(select: str, page: int = 500) -> list[dict]:
         req = urllib.request.Request(
             f"{SUPA}/kb_articles?select={select}&limit={page}&offset={off}",
             headers={"apikey": key, "Authorization": f"Bearer {key}"})
-        rows = json.loads(urllib.request.urlopen(req, timeout=120).read())
+        # the sandbox network drops TLS connections mid-flight; retry before giving up
+        rows = None
+        for attempt in range(4):
+            try:
+                rows = json.loads(urllib.request.urlopen(req, timeout=180).read())
+                break
+            except Exception as e:  # noqa: BLE001
+                if attempt == 3:
+                    raise
+                print(f"  (REST flake {str(e)[:50]} - retry {attempt + 1}/4)", flush=True)
+                time.sleep(3 * (attempt + 1))
         out += rows
         print(f"  fetched {len(out)} articles from the cloud", end="\r", flush=True)
         if len(rows) < page:
