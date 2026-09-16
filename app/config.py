@@ -40,8 +40,22 @@ class Settings(BaseSettings):
     # Routed by capability, not preference: DeepSeek has no vision, so images still go
     # to terra. `text_provider=rkapi` puts everything back on one model.
     text_provider: str = Field(default="deepseek", alias="TEXT_PROVIDER")
+    # `deepseek-flash` reads images as well as text, so vision no longer needs a second
+    # provider. Set to "rkapi" to fail over to gpt-5.6-terra without a code change.
+    vision_provider: str = Field(default="deepseek", alias="VISION_PROVIDER")
     deepseek_api_keys: str = Field(default="", alias="DEEPSEEK_API_KEY")
+    # Two IDs, ONE underlying model, two serving modes — and the difference is the
+    # whole latency budget. `deepseek-chat` answers directly; `deepseek-flash` thinks
+    # first and bills the thinking as output tokens. Measured on the same prompt:
+    # chat = 0 reasoning tokens / 45 completion / 1.26s, flash = 60 / 123 / 1.91s. Across
+    # the 6-8 model calls in one turn that is p50 8.8s vs 16.7s, so text stays on the
+    # non-reasoning mode and only vision pays for thinking.
+    # `deepseek-chat` is an unlisted legacy alias (the /models endpoint returns only
+    # flash and v4-pro) — if it ever stops resolving, set DEEPSEEK_MODEL=deepseek-flash
+    # and accept the latency.
     deepseek_model: str = Field(default="deepseek-chat", alias="DEEPSEEK_MODEL")
+    deepseek_vision_model: str = Field(default="deepseek-flash",
+                                       alias="DEEPSEEK_VISION_MODEL")
     deepseek_base_url: str = Field(default="https://api.deepseek.com",
                                    alias="DEEPSEEK_BASE_URL")
 

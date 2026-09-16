@@ -182,7 +182,13 @@ async def main() -> int:
     started = time.perf_counter()
     shed = [0]
 
-    async with httpx.AsyncClient(limits=limits) as client:
+    # trust_env=False because this talks to 127.0.0.1 and nothing else.
+    # A Windows system proxy (VPN clients set one at 127.0.0.1:7897) is handed to httpx
+    # by urllib's getproxies() WITHOUT the registry's ProxyOverride bypass list, so httpx
+    # tunnels loopback traffic through it and the proxy refuses — every request comes
+    # back as a bare 502 with an empty body, before it ever reaches the app. curl reads
+    # only the env vars, so it keeps working and the failure looks like a server bug.
+    async with httpx.AsyncClient(limits=limits, trust_env=False) as client:
         async def launch(i: int) -> Dict[str, Any]:
             if args.arrival == "stagger":
                 await asyncio.sleep(random.uniform(0, args.spread))

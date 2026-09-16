@@ -369,26 +369,47 @@ async def disambiguate(
     return None, narrowed, "ambiguous"
 
 
+# A row earns a place in a lookup result only if it can say something: a meaning, or
+# steps. The scraped import added 66 codes with `meaning` deliberately NULL (the scrape
+# never carried one) and 26 of those have no steps either — nothing but a code. Those
+# still answered "found", which is the expensive kind of wrong: the composer is told the
+# code is recognised and has nothing to state, and the handoff briefing rendered the
+# literal sentence "Error C1 means: None" to a human agent.
+_HAS_SOMETHING_TO_SAY = """
+    (ec.meaning is not null
+     or case when jsonb_typeof(ec.fix_steps) = 'array'
+             then jsonb_array_length(ec.fix_steps) else 0 end > 0)
+"""
+
+# One code, one answer. E-05 is stored seven times — once per product it can appear on,
+# and six of those products are spare parts (bumpers, brush guards, a wheel) whose names
+# match the vacuum they fit. Same meaning, same steps, seven rows, so `matches[:3]` was
+# three copies of one fact labelled with three accessories. Collapsing on the CONTENT
+# and preferring a real device keeps the answer and drops the noise.
+_ERROR_CODE_SELECT = f"""
+    select distinct on (coalesce(ec.meaning, ''), coalesce(ec.fix_steps::text, ''))
+           ec.code, ec.meaning, ec.severity, ec.fix_steps, ec.source_url, p.sku, p.name
+    from error_codes ec
+    left join products p on p.id = ec.product_id
+    where upper(ec.code) = upper(%s) and {_HAS_SOMETHING_TO_SAY}
+    {{extra}}
+    order by coalesce(ec.meaning, ''), coalesce(ec.fix_steps::text, ''),
+             (p.category in ('accessory', 'service')) nulls last,
+             p.name
+"""
+
+
 async def find_error_code(code: str, product_id: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Exact lookup beats RAG for `E-05`, and it cannot hallucinate a meaning."""
+    """Exact lookup beats RAG for `E-05`, and it cannot hallucinate a meaning.
+
+    The join is LEFT, not inner: the import resolved six codes to no product at all, and
+    an inner join silently dropped them even though they carry usable repair steps.
+    """
     if product_id:
         rows = await db.fetch(
-            """
-            select ec.code, ec.meaning, ec.severity, ec.fix_steps, ec.source_url,
-                   p.sku, p.name
-            from error_codes ec join products p on p.id = ec.product_id
-            where upper(ec.code) = upper(%s) and ec.product_id = %s
-            """,
+            _ERROR_CODE_SELECT.format(extra="and ec.product_id = %s"),
             (code, product_id),
         )
         if rows:
             return rows
-    return await db.fetch(
-        """
-        select ec.code, ec.meaning, ec.severity, ec.fix_steps, ec.source_url, p.sku, p.name
-        from error_codes ec join products p on p.id = ec.product_id
-        where upper(ec.code) = upper(%s)
-        limit 5
-        """,
-        (code,),
-    )
+    return (await db.fetch(_ERROR_CODE_SELECT.format(extra=""), (code,)))[:5]

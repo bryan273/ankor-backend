@@ -234,8 +234,18 @@ class RKAPIClient:
             text = getattr(delta, "content", None)
             if text:
                 yield {"type": "delta", "text": text}
-        usage.cost_credits = price(usage.input, usage.output, usage.cached, usage.model)
+        usage.cost_credits = self.price_usage(usage)
         yield {"type": "usage", "usage": usage}
+
+    def price_usage(self, usage: Usage) -> float:
+        """What this call cost, in the units this provider bills in.
+
+        An instance method so a subclass can override it. It used to call the module
+        function directly, which meant `DeepSeekClient.price` existed, looked correct,
+        and was never once invoked — every DeepSeek call was costed at RKAPI's resale
+        credit rates, on a provider that bills real dollars.
+        """
+        return price(usage.input, usage.output, usage.cached, usage.model)
 
     # ── convenience wrappers ──────────────────────────────────────────────────
     async def complete(

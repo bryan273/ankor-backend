@@ -61,7 +61,13 @@ def check(label: str, ok: bool, detail: str = "") -> bool:
 
 async def main() -> int:
     ok = True
-    async with httpx.AsyncClient() as client:
+    # trust_env=False because this talks to 127.0.0.1 and nothing else.
+    # A Windows system proxy (VPN clients set one at 127.0.0.1:7897) is handed to httpx
+    # by urllib's getproxies() WITHOUT the registry's ProxyOverride bypass list, so httpx
+    # tunnels loopback traffic through it and the proxy refuses — every request comes
+    # back as a bare 502 with an empty body, before it ever reaches the app. curl reads
+    # only the env vars, so it keeps working and the failure looks like a server bug.
+    async with httpx.AsyncClient(trust_env=False) as client:
         print("turn 1 — ambiguous product")
         events, text = await stream(client, "/api/v1/chat",
                                     {"message": "my S1 Pro isn't sucking anymore",

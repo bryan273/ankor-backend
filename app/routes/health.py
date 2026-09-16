@@ -14,6 +14,7 @@ from fastapi import APIRouter
 
 from app.clients import db
 from app.clients.embed import get_embedder
+from app.clients.llm import get_llm
 from app.clients.rkapi import get_rkapi
 from app.clients.vectors import get_vectors
 from app.config import settings
@@ -38,10 +39,18 @@ async def _timed(name: str, coro) -> Dict[str, Any]:
                 "error": f"{type(e).__name__}: {str(e)[:160]}"}
 
 
-async def _ping_rkapi() -> str:
-    text, usage = await get_rkapi().complete(
+async def _ping_llm() -> str:
+    """Probe the model that actually serves turns, not the one that used to.
+
+    This checked RKAPI by name. Once routing moved to DeepSeek that made /healthz
+    actively misleading: it would report green off a provider nothing calls, while every
+    real turn failed. A health check has to exercise the serving path.
+    """
+    llm = get_llm()
+    text, usage = await llm.complete(
         [{"role": "user", "content": "reply with the single word OK"}], max_tokens=2500)
-    return f"{text.strip()[:20]} ({usage.input}/{usage.output} tok)"
+    model = getattr(llm.text, "model", "?")
+    return f"{text.strip()[:20]} ({usage.input}/{usage.output} tok, {model})"
 
 
 async def _ping_embed() -> str:
@@ -62,16 +71,19 @@ async def _ping_db() -> str:
 
 @router.get("/healthz")
 async def healthz() -> Dict[str, Any]:
-    rkapi, embed, vectors, database = await asyncio.gather(
-        _timed("rkapi", _ping_rkapi()),
+    llm, embed, vectors, database = await asyncio.gather(
+        _timed("llm", _ping_llm()),
         _timed("embed", _ping_embed()),
         _timed("pinecone", _ping_vectors()),
         _timed("supabase", _ping_db()),
     )
-    deps = {"rkapi": rkapi, "embed": embed, "pinecone": vectors, "supabase": database}
+    deps = {"llm": llm, "embed": embed, "pinecone": vectors, "supabase": database}
     ok = all(d["ok"] for d in deps.values())
     return {"status": "ok" if ok else "degraded", "version": settings.version,
-            "model": settings.rkapi_model, "lanes": len(settings.rkapi_keys), "deps": deps}
+            "model": getattr(get_llm().text, "model", "?"),
+            "text_provider": settings.text_provider,
+            "vision_provider": settings.vision_provider,
+            "deps": deps}
 
 
 @router.get("/livez")

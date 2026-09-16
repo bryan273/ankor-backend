@@ -96,6 +96,11 @@ async def judge(message: str, reply: str, evidence: str = "") -> Dict[str, Any]:
         return {"empathy": 0, "clarity": 0, "proactivity": 0, "grounded": 0,
                 "notes": "empty reply"}
     try:
+        # Deliberately RKAPI (gpt-5.6-terra) and not the agent's own model, even though
+        # everything else now runs on DeepSeek. A model grading its own output scores its
+        # own habits — the phrasing it would have chosen reads as the correct phrasing.
+        # Keeping the judge on a different family is the whole reason these numbers mean
+        # anything, and it is why the RKAPI keys are still worth having.
         data, _ = await get_rkapi().json_complete(
             [{"role": "user", "content": JUDGE_PROMPT.format(
                 message=message, reply=reply,
@@ -187,7 +192,13 @@ async def main() -> int:
     results: List[Dict[str, Any]] = []
     sem = asyncio.Semaphore(args.concurrency)
 
-    async with httpx.AsyncClient() as client:
+    # trust_env=False because this talks to 127.0.0.1 and nothing else.
+    # A Windows system proxy (VPN clients set one at 127.0.0.1:7897) is handed to httpx
+    # by urllib's getproxies() WITHOUT the registry's ProxyOverride bypass list, so httpx
+    # tunnels loopback traffic through it and the proxy refuses — every request comes
+    # back as a bare 502 with an empty body, before it ever reaches the app. curl reads
+    # only the env vars, so it keeps working and the failure looks like a server bug.
+    async with httpx.AsyncClient(trust_env=False) as client:
         async def guarded(case: Dict[str, Any]) -> Dict[str, Any]:
             async with sem:
                 try:
@@ -221,12 +232,26 @@ async def main() -> int:
     for scenario, outcomes in sorted(by_scenario.items()):
         print(f"  {scenario:6} {sum(outcomes)}/{len(outcomes)}")
 
+    # A judge that failed to run scored nothing, not zero. Averaging its all-zero
+    # placeholder in with real judgements measured the judge's uptime and reported it as
+    # the agent's empathy: three consecutive runs drifted 3.65 → 3.24 → 3.18 on
+    # identical answers, purely because more judge calls fell over. Failures are counted
+    # out loud instead, so a quiet rubric slide can only mean the answers changed.
     judged = [r for r in results if r["scores"]]
-    if judged:
+    failed_judge = [r for r in judged if r["scores"].get("notes", "").startswith(
+        ("judge failed", "empty reply"))]
+    scored = [r for r in judged if r not in failed_judge]
+    if scored:
         print("\nrubric (0-5, judged separately from the structural checks):")
         for key in ("empathy", "clarity", "proactivity", "grounded"):
-            values = [r["scores"].get(key, 0) for r in judged]
+            values = [r["scores"].get(key, 0) for r in scored]
             print(f"  {key:12} {statistics.mean(values):.2f}  (min {min(values):.0f})")
+        print(f"  scored {len(scored)}/{len(judged)} judged cases")
+    if failed_judge:
+        print(f"  JUDGE DID NOT RUN on {len(failed_judge)}: "
+              f"{', '.join(r['name'] for r in failed_judge[:4])}")
+        for r in failed_judge[:2]:
+            print(f"    {r['name']}: {r['scores'].get('notes', '')[:110]}")
 
     latencies = [r["ms"] for r in results if r["ms"]]
     if latencies:

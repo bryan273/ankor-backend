@@ -14,6 +14,13 @@ venv/
 !.env.example
 *.pem
 *.key
+# The import scripts default --key-file to .secrets/supabase_secret_key, which holds
+# the Supabase SERVICE key — full read/write on the project, bypassing row-level
+# security. Nothing here matched that path, so one `git add -A` would have published it.
+.secrets/
+# Scraped source data the import scripts read. Absent from the repo, so without this
+# line it looks like something you forgot to commit rather than something deliberate.
+goldset/
 
 # --- Node if the agent includes a gateway ---
 node_modules/

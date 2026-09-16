@@ -82,7 +82,38 @@ async def main() -> int:
                 print("re-run with --fix to clear it, then re-embed.")
             return 1
 
-        print("\nPASS: every kb vector is backed by a chunk row.")
+        # The other direction, which is the one that actually bit. The check above asks
+        # "does every vector hydrate to text?" and says PASS when it does — it never asks
+        # whether every ARTICLE reached the index. A bulk import wrote 11,910 rows into
+        # kb_articles without anyone running embed_corpus, and this script reported PASS
+        # while 81% of the knowledge base was unreachable by search. Both directions have
+        # to be checked, because each one is silent about the other's failure.
+        unindexed = await db.fetch_one(
+            """
+            select count(*) as n
+            from kb_articles ka
+            where length(ka.body) > 100
+              and not exists (select 1 from kb_chunks kc where kc.article_id = ka.id)
+            """
+        )
+        missing = int(unindexed["n"])
+        indexed = int(articles["n"]) - missing
+        print(f"\narticles with a body:  {articles['n']}")
+        print(f"reached the index:     {indexed}")
+        print(f"never embedded:        {missing} "
+              f"({missing / articles['n'] * 100:.0f}% of the corpus)"
+              if articles["n"] else "")
+
+        if missing > articles["n"] * 0.02:
+            print(
+                "\nFAIL: these articles exist in Postgres and cannot be retrieved. "
+                "Search silently answers as if they were never collected."
+            )
+            print("run: python scripts/embed_corpus.py --only kb")
+            return 1
+
+        print("\nPASS: every kb vector is backed by a chunk row, "
+              "and every article reached the index.")
         return 0
     finally:
         await vectors.aclose()

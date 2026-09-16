@@ -114,7 +114,19 @@ async def _facts(session_id: str) -> str:
                          f"priority {data.get('priority')}")
         elif tool == "lookup_error_code" and data.get("found"):
             match = (data.get("matches") or [{}])[0]
-            facts.append(f"- Error {match.get('code')} means: {match.get('meaning')}")
+            meaning = match.get("meaning")
+            steps = match.get("fix_steps") or []
+            # Some codes are on file with repair steps but no description — the scraped
+            # import never carried one. Interpolating that straight into the sentence
+            # briefed the human agent with "Error C1 means: None".
+            if meaning:
+                facts.append(f"- Error {match.get('code')} means: {meaning}")
+            elif steps:
+                facts.append(f"- Error {match.get('code')} is on file with "
+                             f"{len(steps)} repair steps, but no description")
+            else:
+                facts.append(f"- Error {match.get('code')} is on file, but we hold "
+                             f"nothing about what it means")
         elif tool == "get_troubleshooting_flow" and data.get("found"):
             facts.append(f"- Walked through the '{data.get('symptom')}' repair flow "
                          f"({len(data.get('steps') or [])} steps)")

@@ -129,7 +129,7 @@ afterwards, and the embedder skips content whose hash has not changed.
 ```bash
 python scripts/db_bootstrap.py --apply      # schema — idempotent
 python scripts/crawl_products.py --limit 220
-python scripts/crawl_support.py --limit 550
+python scripts/crawl_support.py --limit 2800   # all four brands; ~2.7k English articles
 python scripts/seed_legacy_products.py      # discontinued products the crawler cannot see
 python scripts/build_aliases.py             # asserts the "s1 pro" ambiguity exists
 python scripts/seed_demo.py                 # asserts the S3 dealer fixture exists
