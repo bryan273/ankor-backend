@@ -27,8 +27,12 @@ you should say so in the log.
 |---|---|---|---|---|
 | `kb_articles` | 14,665 | **14,799** | +134 policy docs (`doc_type='policy'`, new vocabulary value) | KC agent |
 | `products` | 898 | **1,493** | **+595** rows (644 local SKUs total) | KC agent |
-| `product_docs` | 1,272 | 1,272 | unchanged | KC agent |
+| `product_docs` | 1,272 | **1,273** | +1 | not KC agent (see note) |
 | `error_codes` | 139 | 139 | unchanged | KC agent |
+
+Note on the `product_docs` +1: our push wrote nothing to that table; the row appeared during the
+session and is attributed to activity on your side. Flagging it rather than silently bundling it
+into our delta — if that was not you, it is worth a look.
 
 `kb_articles` `doc_type` distribution now: `article` 10,028 · `faq` 2,526 · `manual` 1,247 ·
 `troubleshooting` 864 · **`policy` 134** (sums to 14,799 ✓).
@@ -65,7 +69,24 @@ Measured on live data:
 So "remove duplicates" is really: **collapse region/bundle variants onto a canonical product and
 keep the variants as aliases**, not delete the fact that they exist.
 
-## 3. Tasks and acceptance gates
+### 2.1 The corpus is CLOSED — no further text is coming
+
+You can size the embedding job and stop wondering whether more content will arrive:
+
+- The sitemaps expose **152 URLs that are not stored anywhere** (142 `kb` + 10 `pages`). All 152
+  return **HTTP 404**, verified with controls on two independent networks:
+  - control (an article already stored) fetched from the scrape VM → `200`, 236,392 bytes, text extracted;
+  - control (same class of URL) from a second network → `200`;
+  - the 152 residue URLs → `404` from both, while those controls returned `200`.
+  So they are **delisted upstream** — not a fetch failure, not JS-gating. Retrying them is wasted work.
+- Provenance of that check, including the wrong first attempt, is in workspace commit `7975b40`.
+- `kb_articles` has **zero** rows with an empty or ≤100-char body — all 14,799 rows carry usable
+  text (avg 1,353–11,897 chars by `doc_type`). The `length(body) > 100` filter in your embed query
+  therefore selects the whole table; nothing is silently dropped.
+- A full sweep of the remaining product long tail is running on two scrape VMs (694 candidates:
+  504 anker.com/eufy.com + 190 soundcore.com/ankersolix.com). Expect `product_docs` to grow by a
+  few hundred rows of `storefront_page` text, SKU-linked where the slug carries a SKU.
+
 
 ### 3.1 Canonical / alias model (highest value)
 
@@ -132,7 +153,26 @@ banned for exactly that.
 
 16 NULL `category` → run/extend `scripts/backfill_categories.py`; 46 NULL `price` →
 `scripts/backfill_prices.py`, or mark them explicitly price-unknown rather than leaving NULL
-ambiguous.
+ambiguous. Note the 46 NULL prices concentrate in `-F0` (refurbished) and `BUNDLE-` families,
+where price legitimately lives on the variant page — so treat those as expected, not as defects.
+
+### 3.5 `error_codes` provenance (violates the "real scrape" bar)
+
+Of 139 rows: **73 have `source_url IS NULL`** and **66 have no `meaning`**. They are not invented —
+they came from `service.eufy.com` article text — but with no `source_url` they are unverifiable,
+which is the one thing a demo must never be. Fix deterministically: for each unattributed code,
+find the article whose stored body contains the exact code token, and set `source_url` to that
+article's URL (plus `meaning` from the surrounding sentence when absent). Acceptance gate:
+`select count(*) from error_codes where source_url is null` → 0, and every remaining row's
+`source_url` actually contains that code in its body.
+
+### 3.6 `product_docs` carries noise — prune before embedding
+
+152 of 1,272 rows are ≤500-char marketing/checkout/test stubs (`policy_page` 137, `storefront_page`
+15): `/test`, `/synchrony-checkout`, `/buy-one-get-one-free`, `/trade-in-full`, `/e10-free-quote`,
+`/labor-day-sale-ads`. Embedding them spends quota to teach the agent about sale banners. Decide
+and record: prune by kind+length, or keep with an exclude flag — but do it *before* §3.3, because
+the cost is paid at embed time, not at query time.
 
 ## 4. Git protocol (binding for both agents)
 
@@ -196,7 +236,9 @@ The git history — not this file — is what survives, which is exactly why §4
 | 2026-09-16 | kc-agent | `426e21a` (workspace) | idempotent text push (`push_to_supabase.py`, now shipped in this repo) | `products` 898 → **1,493** (+595) · `kb_articles` 14,665 → **14,799** (+134 `policy`) | `--what all --dry-run` → `to_push: 0`; independent MECE: 0 missing SKUs |
 | 2026-09-16 | kc-agent | `2b58669` (workspace) | authored this handoff | — | this document |
 | 2026-09-16 | kc-agent | `(the commit that adds this file)` (backend) | published this task doc to `docs/tasks/` | — | `git log` on `backend` |
-| 2026-09-16 | kc-agent | `(this commit)` (backend) | shipped the tool into this repo + added a `--coverage` mode | `--coverage` reproduces §2 verbatim: 112/240/128 · 16/46/2 · kb 14,799 · policy 134 | ran from this repo with no local scrape files; key resolved from `.env` |
+| 2026-09-16 | kc-agent | `(this commit)` (backend) | doc updated from the corpus-closure + data-quality findings: §2.1 closed corpus, §3.5 error_codes provenance, §3.6 product_docs noise, §1 drift note | evidence: 152 residue URLs all 404 with 200 controls on two networks; 73/139 codes without `source_url`; 152/1,272 docs ≤500 chars; 0 empty kb bodies | re-verified `embed_corpus.py` still has `BATCH=32` → `embed_many(concurrency=8)` and still 0 `product_docs` references, so §3.2/§3.3 remain open |
+| 2026-09-16 | kc-agent | `7975b40` (workspace) | residue recoverer + tiered extractor (T1 trafilatura / T2 `__NEXT_DATA__` / T3 Shopify JSON) | 152 candidates → all T4 404; 0 rows written | controls returned 200 from both networks; the first (wrong) control is documented in the commit |
+| 2026-09-16 | kc-agent | (running) | full product long-tail sweep on two VMs, split by host | 504 anker.com+eufy.com, 190 soundcore.com+ankersolix.com | sink batches landing in `product_docs` |
 
 **kc-agent notes for the push session (so nothing is re-derived):**
 
