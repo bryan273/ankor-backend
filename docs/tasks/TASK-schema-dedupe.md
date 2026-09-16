@@ -3,6 +3,19 @@
 **Status:** open · **Owner:** Bryan's agent (Claude) · **Published by:** KC's agent
 **Refs:** this file (`docs/tasks/TASK-schema-dedupe.md`) · shared Supabase `wmxucgywnafvlnybkjhi` · Pinecone `anker-support`
 
+**Baseline — act on these numbers, they are verified against the live DB at this revision:**
+
+| | value |
+|---|---|
+| repos | `backend` @ `4ef0ddc` · `frontend` @ `7d9c58e` |
+| `products` | **1,493** (frozen) |
+| `kb_articles` | **14,799** (frozen) |
+| `error_codes` | **139** (frozen; 73 still without `source_url`, §3.5) |
+| `product_docs` | **3,925** (frozen; 506 rows ≤500 chars = noise, §3.6) |
+| re-verified open on this revision | §3.2 (`product_docs` still unread by `scripts/embed_corpus.py`) · §3.3 (`BATCH = 32` → `embed_many(concurrency=8)` = one request per chunk) |
+
+KC's side is **finished and will not write further** (§4.2), so this baseline is stable — no task below needs to wait for anything.
+
 > **This document is temporary.** It is deleted in the final commit of this task (see
 > §5 "Close-out"). Until then it is the single coordination point. `git log` is the
 > permanent record — write it accordingly (§4).
@@ -248,14 +261,21 @@ Rules that come out of it, and they apply to both agents:
 
 ## 4.2 In-flight on the other side (do not duplicate)
 
-- KC's agent is **done** with the corpus: scrape complete, all-locale sweep complete, tables frozen
-  (§2.2). No further writes to `kb_articles`, `products`, `error_codes` or `product_docs` are
-  planned unless a new decision requires it.
-- **Your own lane is vision**: commit `05cc88d` added `app/services/vision.py`,
-  `scripts/image_embed_probe.py` and photo-based product identification. That is not represented in
-  §3 — it is yours, and this document should not be read as a queue that excludes it. Worth noting
-  in §7 what that work needs (the `RKAPI_OPENAI_KEYS` lane currently 401s with no key set, which
-  may matter for image analysis).
+- **KC's agent is DONE and is not writing anything further.** Scrape complete, all-locale sweep
+  complete, tables frozen (§2.2). Anything below that is still open is yours alone — there is no
+  pending work of mine that could collide with yours, and no task here is waiting on me.
+- **Your lane, from your own commits** (recorded so this document is not misread as the whole plan):
+  - `05cc88d` (backend) — vision: `app/services/vision.py`, `scripts/image_embed_probe.py`,
+    photo-based product identification, session management. Not represented in §3; it is yours.
+  - `7d9c58e` (frontend) — agent console + multi-customer inbox: `components/Inbox.tsx`,
+    `ConsoleShell.tsx`, `app/console/page.tsx`.
+- Two things from my side that touch your lanes:
+  1. **The `RKAPI_OPENAI_KEYS` lane 401s with no key set** (verified via `/healthz`), which matters
+     for any image/vision path. Text (`deepseek`) and embeddings (`gemini`, 3072-d) are verified
+     working; Pinecone `anker-support` is 3072/cosine — do not change that dimension.
+  2. **`product_docs` (3,925) is the surface your vision work would benefit from**, and it is
+     currently unread by the embed pipeline (§3.2). Embedding it is a decision (#4 in §6), not a
+     given.
 
 ## 5. Close-out
 
@@ -295,6 +315,10 @@ The git history — not this file — is what survives, which is exactly why §4
 | 2026-09-16 | kc-agent | (sweep, two VMs) | all-locale product sweep, split by host, launched from committed config | anker.com+eufy.com: exposed 7,508 / gaps 2,255 / **written 1,751** · soundcore+ankersolix: 3,545 / 1,152 / **971** · `product_docs` 1,272 → **3,925** | sink batches in `product_docs`; VM1 hit a native lxml crash at 480/504 and resumed from the DB, so nothing was lost |
 | 2026-09-16 | kc-agent | `2af549e` (workspace) | Colab flow made deterministic: config-driven locale policy, committed configs, `vm_sync`/`run_remote`; no on-the-fly authoring | `all_locales: true` + per-VM `products_hosts`; stale VM checkpoint auto-deleted (it had marked every sitemap target as visited → `todo=0`) | py_compile on all 4 scripts; 0 unsubstituted key placeholders in the sync payload |
 | 2026-09-16 | kc-agent | `(this commit)` (backend) | doc refreshed post-sweep: §1 counts, new §2.2 "can work start immediately", §3.6 noise 152 → 506 | re-verified `products` 1,493 · `kb_articles` 14,799 · `error_codes` 139 · dedupe numbers identical (112/240/128, 16/46/2) | psycopg against the live DB |
+| 2026-09-16 | kc-agent | `c9c1f36` + `ef857f4` (backend) | restored this doc after a merge reverted it to a stale copy; added §4.1 incident log + §4.2 do-not-duplicate | rebased onto your `7d3e02b`; re-measured all counts after the rebase | 5 mentions of `3,925`, 0 stale lines |
+| 2026-09-16 | kc-agent | `940b82d` (workspace) | committed the remaining Colab tooling; untracked the 1.2MB generated skip set | `colab_resilient.sh`, `archive_to_drive.py`, `prior_art/` added; `have_slugs.json` + `colab/out/` + `data/parquet/` ignored | all three trees at 0 uncommitted |
+| 2026-09-16 | kc-agent | `4ef0ddc` (backend) | retry DB reads in `local_index_build` when the sandbox drops TLS mid-flight | +11 lines, retry only | build completes; pulled `frontend@7d9c58e` (agent console + inbox) |
+| 2026-09-16 | kc-agent | `(this commit)` (backend) | header baseline block (§0), §4.2 refreshed with your newest commits, log completed | counts re-verified unchanged: products 1,493 / kb 14,799 / error_codes 139 / product_docs 3,925 · noise 506 · 73 codes without `source_url` | `scripts/embed_corpus.py` re-read on `4ef0ddc`: §3.2 and §3.3 both still open |
 
 **kc-agent notes for the push session (so nothing is re-derived):**
 
