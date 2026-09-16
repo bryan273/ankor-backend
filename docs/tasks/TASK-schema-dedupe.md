@@ -193,9 +193,10 @@ The git history — not this file — is what survives, which is exactly why §4
 |---|---|---|---|---|---|
 | 2026-09-16 | kc-agent | `394d566` (workspace) | scraped the remaining content gaps → durable Supabase sink | `kb_articles` → 14,665 · `product_docs` → 1,272 · `error_codes` → 139 | live counts via REST |
 | 2026-09-16 | kc-agent | `e6dcf1e` (workspace) | extract-and-discard scraper mode + Parquet output | — | Colab run receipts |
-| 2026-09-16 | kc-agent | `426e21a` (workspace) | `tools/push_to_supabase.py`: idempotent text push | `products` 898 → **1,493** (+595) · `kb_articles` 14,665 → **14,799** (+134 `policy`) | `--what all --dry-run` → `to_push: 0`; independent MECE: 0 missing SKUs |
+| 2026-09-16 | kc-agent | `426e21a` (workspace) | idempotent text push (`push_to_supabase.py`, now shipped in this repo) | `products` 898 → **1,493** (+595) · `kb_articles` 14,665 → **14,799** (+134 `policy`) | `--what all --dry-run` → `to_push: 0`; independent MECE: 0 missing SKUs |
 | 2026-09-16 | kc-agent | `2b58669` (workspace) | authored this handoff | — | this document |
 | 2026-09-16 | kc-agent | `(the commit that adds this file)` (backend) | published this task doc to `docs/tasks/` | — | `git log` on `backend` |
+| 2026-09-16 | kc-agent | `(this commit)` (backend) | shipped the tool into this repo + added a `--coverage` mode | `--coverage` reproduces §2 verbatim: 112/240/128 · 16/46/2 · kb 14,799 · policy 134 | ran from this repo with no local scrape files; key resolved from `.env` |
 
 **kc-agent notes for the push session (so nothing is re-derived):**
 
@@ -207,6 +208,13 @@ The git history — not this file — is what survives, which is exactly why §4
   and made an early coverage check report 441 false gaps. Always paginate (§8).
 
 ## 8. Repro commands
+
+```bash
+# ONE-COMMAND EVIDENCE for §2 / §3.1 / §3.2 — runs against the live DB, needs no local files.
+# Reproduces §2 verbatim: 112 duplicate slug groups / 240 rows / 128 excess; 16 no_category;
+# 46 no_price; 2 no_slug; kb_articles 14,799 with doc_type='policy' 134.
+python3 scripts/push_to_supabase.py --coverage
+```
 
 ```sql
 -- canonical/alias candidates
@@ -230,8 +238,9 @@ for off in 0 1000 2000; do
   curl -s "https://wmxucgywnafvlnybkjhi.supabase.co/rest/v1/products?select=sku&limit=1000&offset=$off" \
     -H "apikey: $SUPABASE_SECRET_KEY" -H "Authorization: Bearer $SUPABASE_SECRET_KEY"; done
 
-# the push tool (dry-run default; idempotent)
-python3 tools/push_to_supabase.py --what all --dry-run
+# the push surfaces (dry-run default; idempotent). Inputs are KC-side scrape JSONL — absent
+# in this repo, in which case the local-row counts report 0 and nothing is written.
+SCRAPE_INPUT_DIR=<path-to-scrape-jsonl> python3 scripts/push_to_supabase.py --what all --dry-run
 ```
 
 ## 9. Non-goals (unchanged agreement)
