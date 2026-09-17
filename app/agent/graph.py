@@ -739,7 +739,7 @@ class Agent:
                     citations.append(Citation(
                         n=len(citations) + 1,
                         title=f"{name} — authorised dealer record",
-                        section=dealer.get("service_path", "")[:120],
+                        section=(dealer.get("service_path") or "")[:120],
                         url=""))
             elif o.tool in ("search_products", "get_product"):
                 for prod in (o.data.get("products") or

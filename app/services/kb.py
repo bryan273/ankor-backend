@@ -14,8 +14,10 @@ system can make, and a metadata filter costs nothing.
 """
 from __future__ import annotations
 
+import html
 import json
 import os
+import re
 from typing import Any, Dict, List, Optional
 
 import structlog
@@ -84,6 +86,11 @@ async def vector_search(
     ]
 
 
+# How many passages the reranker is ever shown, and therefore the hydration window too:
+# a passage outside it cannot be reached by any path through `search_kb`.
+RERANK_WINDOW = 24
+
+
 async def rerank(question: str, passages: List[Dict[str, Any]], k: int = 6) -> List[Dict[str, Any]]:
     """Listwise LLM rerank, but only when the scores are close enough to be worth it.
 
@@ -100,7 +107,7 @@ async def rerank(question: str, passages: List[Dict[str, Any]], k: int = 6) -> L
     listing = "\n\n".join(
         f"[{i}] {(p.get('title') or p.get('section') or 'passage')}: "
         f"{(p.get('text') or '')[:400]}"
-        for i, p in enumerate(passages[:24])
+        for i, p in enumerate(passages[:RERANK_WINDOW])
     )
     try:
         data, usage = await get_llm().json_complete(
@@ -129,10 +136,18 @@ async def rerank(question: str, passages: List[Dict[str, Any]], k: int = 6) -> L
 # embedding model changes — a floor tuned for one model means nothing for another.
 MIN_RELEVANCE = float(os.getenv("KB_MIN_RELEVANCE", "0.66"))
 
-# At most this many chunks from any one article. Long articles split into many similar
-# chunks that all score alike, and without a cap one document can take every slot: an
-# install question for a product with no coverage came back as six copies of "Display
-# related issues for hubs and docks", which the composer then cited as six sources.
+# At most this many chunks from any one article.
+#
+# The symptom that motivated this — "six copies of 'Display related issues for hubs and
+# docks' cited as six sources" — was not long articles scoring alike. It was the
+# `chunk_text` non-termination bug, which emitted the same paragraph shifted by one
+# character hundreds of times; 97% of the index was duplicates. That is fixed, and the
+# rebuilt corpus is shallow: 7,597 of 8,071 articles produce ONE chunk, and only 90
+# produce more than two, so this cap now binds on roughly 1% of the corpus.
+#
+# It is kept because it is still the right rule for those 90 — a 12-chunk manual should
+# not fill a 6-slot answer — but it is no longer load-bearing, and raising it is a
+# defensible change to measure rather than the safety net it used to be.
 MAX_PER_ARTICLE = 2
 
 
@@ -176,8 +191,80 @@ async def search_kb(
                  best=round(candidates[0].get("score", 0), 3) if candidates else 0)
         return []
 
-    ranked = await rerank(query, usable, k=k * 2)
-    return await _hydrate(diversify(ranked, k))
+    # Hydrate BEFORE reranking, not after.
+    #
+    # `vector_search` returns Pinecone metadata, which carries no text — only
+    # `article_id, title, url, doc_type, sku, ord`. Reranking that meant handing the
+    # model a listing of `[0] Soundcore:` with an empty body for every passage, because
+    # `p.get("text")` was always None and 60% of titles are the site name. The rerank
+    # prompt is also allowed to DROP passages, so it was discarding real answers on the
+    # strength of no information at all. It ran on nearly every query too: it triggers
+    # when the top-to-kth score spread is under 0.12, and this embedding model's spread
+    # over a good result set is about 0.01.
+    #
+    # Only the first RERANK_WINDOW are ever shown to the model, and when rerank is
+    # skipped it returns `passages[:k]` with k well under that — so hydrating the whole
+    # 40-candidate set fetches rows nothing can reach. Measured at 0.74s for 40 rows.
+    hydrated = await _hydrate(usable[:RERANK_WINDOW])
+    ranked = await rerank(query, hydrated, k=k * 2)
+    return diversify(ranked, k)
+
+
+# 4,826 of the 8,071 indexed articles — 60% — carry one of three site-chrome titles
+# instead of their own: `Anker` (1,527), `Soundcore` (1,261), and
+# `eufy Support | Troubleshooting &amp; Customer Service` (2,038). The crawler read the
+# page's <title>, which on these support pages is the site name.
+#
+# The bodies are fine; only the label is wrong. But the label is what the composer cites,
+# so "how do I reset my earbuds" returns seven correct, distinct reset guides all called
+# "Soundcore", and the customer is shown seven identical sources. Deriving the title from
+# the body's opening sentence recovers the real one — these articles open by naming
+# themselves ("This article will show you how to reset soundcore Liberty 5").
+_CHROME_TITLES = {
+    "anker", "soundcore", "eufy", "eufy support", "anker solix", "ankermake", "eufymake",
+    "eufy support | troubleshooting & customer service",
+}
+_TITLE_MAX = 90
+
+
+def _from_slug(url: Optional[str]) -> str:
+    """`.../how-to-reset-liberty-4` -> `How to reset liberty 4`. The last resort."""
+    slug = (url or "").rstrip("/").rsplit("/", 1)[-1].split("?")[0]
+    words = [w for w in re.split(r"[-_]+", slug) if w]
+    # Digits are kept — they are usually the model ("liberty-4-nc") — but a slug that is
+    # ONLY digits is an opaque article id and makes a worse label than the site name.
+    if len([w for w in words if re.search(r"[A-Za-z]", w)]) < 2:
+        return ""
+    return " ".join(words).capitalize()
+
+
+def display_title(title: Optional[str], text: Optional[str],
+                  url: Optional[str] = None, ord_: int = 0) -> str:
+    """The article's own title, or its opening sentence when the title is site chrome.
+
+    `ord_` is which chunk of the article this is, and it decides whether the body may be
+    used at all. Only chunk 0 opens where the article opens; a later chunk opens wherever
+    the splitter happened to cut, so deriving from it produces labels like "To reset your
+    earbuds: 1" or "1. Place the earbuds in the charging case". Those read as titles at a
+    glance, which makes them worse than an honest fallback — so later chunks go straight
+    to the URL slug.
+    """
+    clean = html.unescape((title or "").strip())
+    if clean and clean.strip().lower().rstrip(" -|") not in _CHROME_TITLES:
+        return clean
+
+    body = html.unescape((text or "").strip())
+    if body and ord_ == 0:
+        # First sentence, or the first line if the opening runs long without punctuation.
+        first = body.split("\n", 1)[0].strip()
+        match = re.search(r"^(.{10,%d}?[.!?])(?:\s|$)" % _TITLE_MAX, first)
+        candidate = (match.group(1) if match else first)[:_TITLE_MAX].strip(" .,-:")
+        # Even chunk 0 can start with boilerplate ("Method 1: 1"). Require three real
+        # words — counting tokens is not enough, since that string is three of them.
+        if len(re.findall(r"[A-Za-z]{3,}", candidate)) >= 3:
+            return candidate
+
+    return _from_slug(url) or clean
 
 
 async def _hydrate(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -188,7 +275,7 @@ async def _hydrate(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         return chunks
     rows = await db.fetch(
         """
-        select kc.pinecone_id, kc.text, kc.meta, ka.title, ka.source_url, ka.doc_type
+        select kc.pinecone_id, kc.text, kc.ord, kc.meta, ka.title, ka.source_url, ka.doc_type
         from kb_chunks kc join kb_articles ka on ka.id = kc.article_id
         where kc.pinecone_id = any(%s)
         """,
@@ -202,7 +289,10 @@ async def _hydrate(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             meta = row.get("meta") or {}
             if isinstance(meta, str):
                 meta = json.loads(meta)
-            out.append({**c, "text": row["text"], "title": row["title"],
+            out.append({**c, "text": row["text"],
+                        "title": display_title(row["title"], row["text"], row["source_url"],
+                                               row["ord"]),
+                        "source_title": row["title"],
                         "url": row["source_url"], "doc_type": row["doc_type"],
                         "section": meta.get("section", ""), "page": meta.get("page")})
         else:

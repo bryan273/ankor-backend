@@ -19,11 +19,21 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import io
 import json
 import pathlib
 import statistics
 import sys
 import time
+
+# Windows picks cp1252 for a redirected stdout, and this script prints box-drawing rules
+# and check marks. Running it straight to a terminal worked while `> results.txt` died on
+# `UnicodeEncodeError` — so the harness failed only when someone kept the output.
+if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace",
+                                  line_buffering=True)
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace",
+                                  line_buffering=True)
 from typing import Any, Callable, Dict, List, Optional
 
 import httpx
@@ -117,9 +127,53 @@ async def judge(message: str, reply: str, evidence: str = "") -> Dict[str, Any]:
 
 # ── cases ─────────────────────────────────────────────────────────────────────
 
+async def upload_photo(client: httpx.AsyncClient, path: str) -> Optional[str]:
+    """Attach a real image, so photo cases exercise the real vision path."""
+    file = pathlib.Path(path)
+    if not file.exists():
+        log.warning("eval.photo_missing", path=path)
+        return None
+    with file.open("rb") as fh:
+        r = await client.post(f"{BASE}/api/v1/attachments",
+                              headers={"X-API-Key": settings.backend_api_key},
+                              files={"file": (file.name, fh, "image/jpeg")}, timeout=180.0)
+    if r.status_code != 200:
+        log.warning("eval.photo_upload_failed", status=r.status_code)
+        return None
+    return r.json().get("attachment_id")
+
+
 async def run_case(client: httpx.AsyncClient, case: Dict[str, Any],
                    want_judge: bool) -> Dict[str, Any]:
-    turn = await run_turn(client, {"message": case["message"], "locale": "en"})
+    """Drive one case. A case is one message, or a list of `turns` in one session.
+
+    Multi-turn exists because the things most likely to regress are the things that
+    span turns: a photo sent once and referred to three messages later, a device
+    resolved in turn one and assumed in turn two. A suite that can only send one
+    message cannot see any of that, and those are exactly the paths a customer walks.
+
+    Checks run against the LAST turn — that is where "did it still know?" is visible.
+    """
+    attachment_ids = []
+    if case.get("photo"):
+        got = await upload_photo(client, case["photo"])
+        if got:
+            attachment_ids = [got]
+
+    messages = case.get("turns") or [case["message"]]
+    session_id: Optional[str] = None
+    turn = None
+    for i, message in enumerate(messages):
+        payload: Dict[str, Any] = {"message": message, "locale": "en"}
+        if session_id:
+            payload["session_id"] = session_id
+        # The photo rides on the FIRST turn only. Later turns deliberately carry none,
+        # which is the whole point of a photo-memory case.
+        if i == 0 and attachment_ids:
+            payload["attachment_ids"] = attachment_ids
+        turn = await run_turn(client, payload)
+        session_id = session_id or turn.session_id
+
     failures = []
     for check in case["checks"]:
         try:
@@ -131,10 +185,11 @@ async def run_case(client: httpx.AsyncClient, case: Dict[str, Any],
 
     scores = {}
     if want_judge and case.get("judge") and not turn.error:
-        scores = await judge(case["message"], turn.text, turn.evidence())
+        scores = await judge(messages[-1], turn.text, turn.evidence())
 
     return {
         "name": case["name"], "scenario": case["scenario"], "passed": not failures,
+        "turns": len(messages),
         "failures": failures, "scores": scores, "ms": turn.ms,
         "tools": turn.tools, "blocks": turn.block_types, "emotion": turn.emotion,
         "guard_hits": turn.guard_hits, "text": turn.text,

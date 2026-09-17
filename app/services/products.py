@@ -59,7 +59,7 @@ async def find_by_alias(mention: str) -> List[Dict[str, Any]]:
                p.hero_image, p.price, p.status, a.confidence
         from product_aliases a
         join products p on p.id = a.product_id
-        where a.alias = %s
+        where a.alias = %s and p.status <> 'invalid'
         order by a.confidence desc, p.name
         """,
         (alias,),
@@ -74,6 +74,7 @@ async def find_by_alias(mention: str) -> List[Dict[str, Any]]:
         from product_aliases a
         join products p on p.id = a.product_id
         where %s like '%%' || a.alias || '%%' and length(a.alias) >= 4
+          and p.status <> 'invalid'
         order by a.confidence desc, p.name
         limit 12
         """,
@@ -390,7 +391,7 @@ async def candidates_from_photo(
             from products p
             where p.category = %s
               and p.hero_image is not null
-              and p.status <> 'discontinued'
+              and p.status not in ('discontinued', 'invalid')
               and (%s = '' or lower(p.brand) = %s)
             order by (p.name like '%%+%%' or p.sku ilike 'BUNDLE-%%'),
                      p.price desc nulls last, p.name
@@ -461,7 +462,16 @@ _HAS_SOMETHING_TO_SAY = """
     (ec.meaning is not null
      or case when jsonb_typeof(ec.fix_steps) = 'array'
              then jsonb_array_length(ec.fix_steps) else 0 end > 0)
+    and coalesce(ec.provenance, '') <> 'scraped_unattributed'
 """
+
+# `scraped_unattributed` is the second half of the same problem, and having steps is not
+# enough to be worth serving. 33 rows carry one identical 12-step list stamped onto every
+# code named in `S1-Pro-Common-Voice-Errors-and-Basic-Troubleshooting-Guide` — and the
+# extractor filed them against the eufy Wearable Breast Pump S1 Pro, because "S1 Pro" is
+# also the Robot Vacuum Omni S1 Pro. So E72 on a breast pump answered "turn the robot
+# over and clean the brush slot", from the deterministic tool the agent trusts above RAG.
+# See scripts/audit_error_codes.py.
 
 # One code, one answer. E-05 is stored seven times — once per product it can appear on,
 # and six of those products are spare parts (bumpers, brush guards, a wheel) whose names

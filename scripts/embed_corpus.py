@@ -34,7 +34,9 @@ from app.clients.vectors import (NS_DEALERS, NS_KB, NS_PRODUCTS,  # noqa: E402
 
 log = structlog.get_logger("embed")
 
-BATCH = 32
+# Matches `embed.BATCH_LIMIT`: batchEmbedContents takes 100 contents per request,
+# and the whole point of the change is to send as few requests as the API allows.
+BATCH = 100
 
 
 def approx_tokens(text: str) -> int:
@@ -60,7 +62,11 @@ def product_text(row: Dict[str, Any]) -> str:
     parts = [
         f"{row['brand']} {row['name']}",
         f"Category: {row.get('category') or 'unknown'}",
-        raw.get("description", "")[:600],
+        # `.get(key, "")` returns None when the key EXISTS with a null value, and the
+        # slice then raises. That is what stopped this script at ~898 of 1,493 products:
+        # it crashed mid-run, and because nothing checked the exit code the catalogue sat
+        # 40% unindexed while every other namespace looked healthy.
+        (raw.get("description") or "")[:600],
     ]
     if row.get("specs"):
         parts.append("Specifications: " + "; ".join(
@@ -87,6 +93,7 @@ async def embed_products(force: bool = False) -> int:
                  (select array_agg(a.alias) from product_aliases a
                   where a.product_id = p.id), '{}') as aliases
         from products p
+        where p.status <> 'invalid'
         """
     )
     if not rows:
@@ -147,70 +154,136 @@ def chunk_text(text: str, size: int = 3200, overlap: int = 480) -> List[str]:
                     end = cut + len(boundary)
                     break
         chunks.append(text[start:end].strip())
+        # Stop at the end of the text. Without this the loop degenerates: once `end` is
+        # len(text), `end - overlap` is behind `start`, so `start` advances ONE CHARACTER
+        # per iteration and emits a near-identical chunk each time. A 3,494-character
+        # article produced 402 chunks that way — the index filled with copies of the same
+        # paragraph offset by a character, which is also why `kb.MAX_PER_ARTICLE` had to
+        # exist to stop one article swamping every top-k.
+        if end >= len(text):
+            break
         start = max(end - overlap, start + 1)
     return [c for c in chunks if len(c) > 80]
 
 
 async def embed_kb(force: bool = False) -> int:
+    """Embed the articles worth embedding, using their cleaned text.
+
+    Two filters, both added after a bulk import grew the table from 2.7k to 14.8k rows:
+
+    `embed_status <> 'chrome'/'non_english'` — `scripts/triage_kb_corpus.py` marks rows
+    that are navigation rails, question-title lists or not in English. Embedding those
+    spends a request each to teach the agent about sale banners, and the corpus already
+    demonstrated the cost of it: a wrong-product article that clears the relevance floor
+    answers confidently and wrongly.
+
+    `coalesce(clean_body, body)` — the cleaned text with the rails stripped. Rows that
+    predate the triage have no `clean_body` and fall back to their original body, so
+    this is safe to run before the triage as well as after.
+    """
     articles = await db.fetch(
-        "select id::text as id, source_url, title, doc_type, body, product_ids "
-        "from kb_articles where body is not null and length(body) > 100")
+        "select id::text as id, source_url, title, doc_type, "
+        "       coalesce(clean_body, body) as body, product_ids "
+        "from kb_articles "
+        "where coalesce(clean_body, body) is not null "
+        "  and length(coalesce(clean_body, body)) > 100 "
+        "  and coalesce(embed_status, 'keep') = 'keep'")
     if not articles:
         log.info("embed.kb_empty")
         return 0
 
-    total, skipped = 0, 0
+    # Two lookups for the whole run instead of two per chunk.
+    #
+    # This loop used to issue one `select … from kb_chunks where article_id = … and
+    # ord = …` for EVERY chunk, plus one SKU query per article. Against the Supabase
+    # pooler that is ~7,500 sequential round-trips before the first vector is computed —
+    # the job appeared hung for forty minutes while it did nothing but ask the database
+    # questions it could have asked once. The embedding API was never the bottleneck.
+    log.info("embed.kb_preload", articles=len(articles))
+    existing_chunks: Dict[str, Dict[int, Dict[str, Any]]] = {}
+    for row in await db.fetch(
+        "select article_id::text as article_id, ord, text_hash, pinecone_id "
+        "from kb_chunks"
+    ):
+        existing_chunks.setdefault(row["article_id"], {})[row["ord"]] = row
+
+    sku_by_product: Dict[str, str] = {
+        r["id"]: r["sku"]
+        for r in await db.fetch("select id::text as id, sku from products")
+    }
+
+    # One buffer for the WHOLE run, not one per article.
+    #
+    # The flush used to live inside the article loop — `for i in range(0, len(to_embed),
+    # BATCH)` over a single article's chunks. Articles average under two chunks each, so a
+    # 100-content window never filled: the run issued one embed request, one Pinecone
+    # upsert and one DB round-trip PER ARTICLE. Measured at 36 articles/min, which is
+    # 3.7 hours and ~8,000 requests for this corpus — the request-per-chunk pattern that
+    # already cost this project a Google account, wearing a different hat. Chunks now
+    # queue across articles and go out only when a full batch exists.
+    pending: List[Dict[str, Any]] = []
+    total, skipped, done = 0, 0, 0
+
+    async def flush() -> int:
+        """Embed, upsert and record everything queued. Leaves `pending` empty."""
+        if not pending:
+            return 0
+        values = await embed_batch([p["text"] for p in pending])
+        vectors = [
+            {"id": p["pinecone_id"], "values": vector,
+             "metadata": {"article_id": p["article_id"], "title": p["title"],
+                          "url": p["url"], "doc_type": p["doc_type"],
+                          "sku": p["skus"], "ord": p["ord"]}}
+            for p, vector in zip(pending, values)
+        ]
+        written = await get_vectors().upsert(vectors, NS_KB)
+        await db.execute_many(
+            """
+            insert into kb_chunks (article_id, ord, text, text_hash, pinecone_id, meta,
+                                   embedded_at)
+            values (%s,%s,%s,%s,%s,%s, now())
+            on conflict (article_id, ord) do update set
+                text = excluded.text, text_hash = excluded.text_hash,
+                pinecone_id = excluded.pinecone_id, embedded_at = now()
+            """,
+            [(p["article_id"], p["ord"], p["text"], p["hash"], p["pinecone_id"],
+              json.dumps({"section": p["title"], "url": p["url"]}))
+             for p in pending],
+        )
+        pending.clear()
+        return written
+
     for article in articles:
         pieces = chunk_text(article["body"])
-        skus: List[str] = []
-        if article.get("product_ids"):
-            rows = await db.fetch(
-                "select sku from products where id::text = any(%s)",
-                ([str(p) for p in article["product_ids"]],))
-            skus = [r["sku"] for r in rows]
+        skus: List[str] = [
+            sku_by_product[str(pid)] for pid in (article.get("product_ids") or [])
+            if str(pid) in sku_by_product
+        ]
+        seen_chunks = existing_chunks.get(article["id"], {})
 
-        to_embed, meta_rows = [], []
         for ord_, piece in enumerate(pieces):
             h = text_hash(piece)
-            existing = await db.fetch_one(
-                "select pinecone_id, text_hash from kb_chunks where article_id = %s and ord = %s",
-                (article["id"], ord_))
+            existing = seen_chunks.get(ord_)
             if existing and existing["text_hash"] == h and existing["pinecone_id"] and not force:
                 skipped += 1
                 continue
-            pinecone_id = (existing or {}).get("pinecone_id") or f"kb_{uuid.uuid4().hex[:16]}"
-            to_embed.append(piece)
-            meta_rows.append({"ord": ord_, "hash": h, "pinecone_id": pinecone_id,
-                              "text": piece})
+            pending.append({
+                "article_id": article["id"], "ord": ord_, "text": piece, "hash": h,
+                "pinecone_id": ((existing or {}).get("pinecone_id")
+                                or f"kb_{uuid.uuid4().hex[:16]}"),
+                "title": article["title"] or "", "url": article["source_url"],
+                "doc_type": article["doc_type"] or "", "skus": skus,
+            })
+            # Appends are one at a time, so this trips at exactly BATCH.
+            if len(pending) >= BATCH:
+                total += await flush()
 
-        for i in range(0, len(to_embed), BATCH):
-            batch_texts = to_embed[i:i + BATCH]
-            batch_meta = meta_rows[i:i + BATCH]
-            values = await embed_batch(batch_texts)
-            vectors = []
-            for meta, vector in zip(batch_meta, values):
-                vectors.append({
-                    "id": meta["pinecone_id"], "values": vector,
-                    "metadata": {
-                        "article_id": article["id"], "title": article["title"] or "",
-                        "url": article["source_url"], "doc_type": article["doc_type"] or "",
-                        "sku": skus, "ord": meta["ord"],
-                    },
-                })
-            total += await get_vectors().upsert(vectors, NS_KB)
-            await db.execute_many(
-                """
-                insert into kb_chunks (article_id, ord, text, text_hash, pinecone_id, meta,
-                                       embedded_at)
-                values (%s,%s,%s,%s,%s,%s, now())
-                on conflict (article_id, ord) do update set
-                    text = excluded.text, text_hash = excluded.text_hash,
-                    pinecone_id = excluded.pinecone_id, embedded_at = now()
-                """,
-                [(article["id"], m["ord"], m["text"], m["hash"], m["pinecone_id"],
-                  json.dumps({"section": article["title"] or "", "url": article["source_url"]}))
-                 for m in batch_meta],
-            )
+        done += 1
+        if done % 500 == 0:
+            log.info("embed.kb_progress", articles=done, of=len(articles),
+                     embedded=total, queued=len(pending), skipped=skipped)
+
+    total += await flush()
     log.info("embed.kb_done", embedded=total, skipped_unchanged=skipped)
     return total
 

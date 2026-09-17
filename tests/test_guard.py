@@ -302,3 +302,66 @@ def test_ordinary_english_is_not_a_coverage_ruling(sentence: str) -> None:
 ])
 def test_a_coverage_ruling_is_always_caught(sentence: str) -> None:
     assert guard.COVERAGE_RE.search(sentence) is not None, sentence
+
+
+# ── G3b: a code's MEANING must come from the code table ───────────────────────
+#
+# Caught by `data_unknown_error_code_not_faked` failing one run in three. The customer
+# asked what error C10 means; the agent told them. C10 is not an error code — the row in
+# `error_codes` has no meaning and no steps, and its `source_url` is a product manual:
+#
+#     Robot-Vacuum-Auto-Empty-C10-Руководство-пользователя-T2292
+#
+# The crawler read a product model number as an error code, and 25 other rows are the
+# same mistake. `lookup_error_code` correctly returns `found: false`, so the composer
+# built the definition out of KB passages about the C10 *vacuum* instead. G3 could not
+# catch it twice over: its pattern only matched `E`/`F` prefixes, and even widened it
+# only asks whether the code appears in the evidence — which it did.
+
+def test_g3b_blocks_a_meaning_with_no_code_table_entry():
+    s = state(observations=[tool("lookup_error_code",
+                                 {"found": False, "code": "C10", "matches": []})])
+    hits, replan = check(s, "C10 means the dust bag is full and needs replacing.")
+    assert "G3b" in [h.rule_id for h in hits]
+    assert replan is True
+
+
+def test_g3b_fires_even_when_a_manual_mentions_the_code():
+    """The exact failure: the code IS in the evidence, as a product name."""
+    s = state(observations=[
+        tool("lookup_error_code", {"found": False, "code": "C10", "matches": []}),
+        tool("search_kb", {"found": True, "passages": [
+            {"text": "Robot Vacuum Auto Empty C10 user manual", "title": "C10"}]}),
+    ])
+    hits, _ = check(s, "Error C10 indicates a blocked brush roll.")
+    assert "G3b" in [h.rule_id for h in hits]
+
+
+def test_g3b_allows_a_meaning_that_came_from_the_table():
+    s = state(observations=[tool("lookup_error_code", {
+        "found": True, "code": "E-05",
+        "matches": [{"code": "E-05", "meaning": "Brush roll blocked",
+                     "fix_steps": ["Remove the brush"]}]})])
+    hits, _ = check(s, "E-05 means the brush roll is blocked. Here is how to clear it.")
+    assert "G3b" not in [h.rule_id for h in hits]
+
+
+def test_g3b_ignores_a_draft_that_only_names_the_code():
+    """Repeating the code back is not a definition — it must not force a re-draft."""
+    s = state(observations=[tool("lookup_error_code",
+                                 {"found": False, "code": "C10", "matches": []})])
+    hits, _ = check(s, "I don't have C10 in my error-code table. What is the robot doing?")
+    assert "G3b" not in [h.rule_id for h in hits]
+
+
+def test_g3b_repair_instruction_names_the_code():
+    s = state(observations=[tool("lookup_error_code",
+                                 {"found": False, "code": "C10", "matches": []})])
+    hits, _ = check(s, "C10 means the dust bag is full.")
+    assert "C10" in repair_instruction([h for h in hits if h.rule_id == "G3b"], s)
+
+
+def test_g3_now_sees_c_prefixed_codes():
+    """`ERROR_CODE_RE` was `[EeFf]` only, so C-codes bypassed G3 entirely."""
+    assert guard.ERROR_CODE_RE.search("the display shows C10") is not None
+    assert guard.ERROR_CODE_RE.search("error E-05 again") is not None

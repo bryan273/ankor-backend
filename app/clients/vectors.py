@@ -97,6 +97,19 @@ class VectorStore:
         r.raise_for_status()
         return r.json().get("matches", [])
 
+    async def delete_ids(self, ids: Sequence[str], namespace: str) -> int:
+        """Remove specific vectors. Needed whenever a row leaves the retrievable set —
+        quarantined catalogue rows, for instance — because the vector outlives the row
+        and a stale match still occupies a top-k slot it no longer deserves."""
+        if not ids:
+            return 0
+        client = await self._http()
+        r = await client.post("/vectors/delete",
+                              json={"ids": list(ids), "namespace": namespace})
+        if r.status_code not in (200, 404):
+            r.raise_for_status()
+        return len(ids)
+
     async def delete_namespace(self, namespace: str) -> None:
         client = await self._http()
         r = await client.post("/vectors/delete", json={"deleteAll": True, "namespace": namespace})

@@ -70,7 +70,19 @@ COVERAGE_RE = re.compile(
 # require the engine to have run.
 PRICE_RE = re.compile(r"[$€£¥]\s?\d[\d,.]*|\b\d[\d,.]*\s?(?:USD|EUR|GBP|RMB|IDR)\b")
 SKU_RE = re.compile(r"\b[A-Z]\d{3,4}[A-Z0-9]*\b")
-ERROR_CODE_RE = re.compile(r"\b[EeFf][-–]?\d{1,3}\b")
+# eufy/Anker codes use E, C and F prefixes: E-01, E130, C10, C220, F2. `C` was missing,
+# which is how "C10" reached a customer unchecked — G3 never even looked at it.
+ERROR_CODE_RE = re.compile(r"\b[EeFfCc][-–]?\d{1,3}\b")
+
+# An assertion of what a code MEANS, as opposed to merely naming it. "C10 means", "error
+# C10 indicates", "E-05 refers to". G3 only asks whether the code appears somewhere in
+# the evidence, and for C10 it did — in KB passages about the eufy C10 robot vacuum,
+# because the crawler stored that product's model number as an error code. So the code
+# was "grounded" while its meaning was invented.
+CODE_MEANING_RE = re.compile(
+    r"\b(?:error\s+|code\s+)?([EeFfCc][-–]?\d{1,3})\b\s*"
+    r"(?:means|indicates|signals|signifies|stands for|refers to|is the code for)",
+    re.IGNORECASE)
 
 SAFETY_WORDS = re.compile(
     r"\b(swell|swelling|bulging|burn|burning|smoke|smoking|fire|spark|melt|melting|"
@@ -156,6 +168,27 @@ def check(state: AgentState, draft: str) -> Tuple[List[GuardHit], bool]:
                                  detail=f"error code not in any tool result: {code}"))
             break
 
+    # G3b — a code's MEANING has to come from the code table, not from prose that
+    # happens to mention the code. `lookup_error_code` returns `found: false` when the
+    # row carries no meaning and no steps, which is the honest answer for the 26 rows in
+    # `error_codes` that are really product model numbers the crawler misread. Without
+    # this rule the composer read a C10 *product* manual and told the customer what the
+    # C10 *error* meant.
+    for code in set(m.group(1) for m in CODE_MEANING_RE.finditer(draft)):
+        wanted = code.upper().replace("–", "-").replace("-", "")
+        explained = any(
+            o.tool == "lookup_error_code" and o.ok and o.data.get("found")
+            and any(str(m.get("code", "")).upper().replace("-", "") == wanted
+                    and (m.get("meaning") or m.get("fix_steps"))
+                    for m in (o.data.get("matches") or []))
+            for o in state.observations)
+        if not explained:
+            hits.append(GuardHit(
+                rule_id="G3b",
+                detail=f"stated what {code} means without a code-table entry for it"))
+            must_replan = True
+            break
+
     # G4 — safety outranks troubleshooting.
     if state.perception.safety_concern:
         if step_like and not re.search(r"\b(stop using|unplug|disconnect|do not charge)\b",
@@ -217,6 +250,12 @@ def repair_instruction(hits: List[GuardHit], state: AgentState) -> str:
         elif h.rule_id == "G3":
             lines.append(f"Remove this — it is not in any tool result: {h.detail.split(': ')[-1]}. "
                          "Only use values that appear in the tool output.")
+        elif h.rule_id == "G3b":
+            code = h.detail.split()[2] if len(h.detail.split()) > 2 else "that code"
+            lines.append(
+                f"Do not say what {code} means — it is not in the error-code table. A "
+                f"manual that merely mentions {code} is not a definition. Say the code "
+                "is not one you have on file and ask what the device is doing.")
         elif h.rule_id == "G4":
             lines.append("Safety case: no troubleshooting. Tell them to stop using the device, "
                          "unplug it if safe, keep it clear of anything flammable, and that a "

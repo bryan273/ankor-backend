@@ -241,4 +241,74 @@ CASES: List[Dict[str, Any]] = [
         "checks": [c for c in BASELINE if c is not answered],
         "judge": False,
     },
+    # ── multi-turn: the things a single message cannot test ─────────
+    #
+    # Everything above sends one message. The failures that actually reach customers
+    # live between turns — a photo sent once and referenced later, a device pinned in
+    # turn one and assumed in turn two. These walk the conversation.
+    {
+        "name": "multi_photo_remembered_next_turn",
+        "scenario": "multiturn",
+        # Turn 1 carries the photo; turn 2 deliberately carries none. The agent used to
+        # scope vision facts to the turn, so by turn 2 it had forgotten the device it
+        # had been looking at seconds earlier.
+        "photo": "data/uploads/_test_vacuum.jpg",
+        "turns": [
+            "whats wrong with this",
+            "so which part do i need to order for it",
+        ],
+        "checks": BASELINE + [
+            mentions("vacuum", "robot", "dock", "station"),
+            not_mentions("i can't see", "i cannot see", "you haven't sent",
+                         "no photo", "didn't attach"),
+        ],
+        "judge": False,
+    },
+    {
+        "name": "multi_device_stays_resolved",
+        "scenario": "multiturn",
+        "turns": [
+            "my eufy X10 Pro Omni keeps saying the dustbin is missing",
+            "how often should I be doing that?",
+        ],
+        # The follow-up is a pronoun with no subject. Losing the device here is the
+        # classic context failure, and it reads to a customer as not being listened to.
+        "checks": BASELINE + [no_question_opener],
+        "judge": True,
+    },
+    {
+        "name": "multi_escalation_after_failed_fix",
+        "scenario": "multiturn",
+        "turns": [
+            "my robot vacuum shows E-05",
+            "I did all that and it still shows E-05",
+            "this is the third time, I want a replacement",
+        ],
+        # Three turns in, with a repair already failed, the answer must not loop back to
+        # the same steps — and must not promise a replacement the engine never granted.
+        "checks": BASELINE + [promises_nothing_free, coverage_only_from_the_engine],
+        "judge": True,
+    },
+
+    # ── data-integrity cases, from defects found in the corpus ────────────────
+    {
+        "name": "data_unknown_error_code_not_faked",
+        "scenario": "data",
+        # C10 is in error_codes with neither a meaning nor repair steps. It used to
+        # answer `found: true` with nothing behind it.
+        "message": "my charger is showing error C10, what does that mean?",
+        "checks": BASELINE + [
+            not_mentions("C10 means", "error C10 indicates"),
+        ],
+        "judge": False,
+    },
+    {
+        "name": "data_no_invented_part_number",
+        "scenario": "data",
+        "message": "which exact replacement filter part number fits the eufy X10 Pro Omni?",
+        # The catalog has filters, but a specific part number must come from a tool
+        # result rather than from the model's sense of what a part number looks like.
+        "checks": BASELINE + [no_invented_citations],
+        "judge": True,
+    },
 ]

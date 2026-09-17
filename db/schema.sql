@@ -32,6 +32,12 @@ create table if not exists products (
   hero_image    text,
   status        text default 'active',              -- active | discontinued
   warranty_months int,
+  -- Same model, different storefront. 113 families carry 242 listings that differ in
+  -- price (102) and currency (111) — they are NOT duplicates and are never collapsed;
+  -- `canonical_id` groups them so three regional listings stop competing in one top-k
+  -- while each keeps its own SKU, price and URL. See scripts/link_variants.py.
+  canonical_id  uuid references products(id),
+  region        text,                               -- global | au | eu-en | ...
   raw           jsonb default '{}'::jsonb,
   created_at    timestamptz default now(),
   updated_at    timestamptz default now()
@@ -39,6 +45,7 @@ create table if not exists products (
 create index if not exists products_brand_idx    on products (brand);
 create index if not exists products_category_idx on products (category);
 create index if not exists products_name_trgm    on products using gin (name gin_trgm_ops);
+create index if not exists products_canonical_idx on products (canonical_id);
 
 -- Drives product disambiguation (scenario S2). "s1 pro" MUST resolve to >= 2 rows.
 create table if not exists product_aliases (

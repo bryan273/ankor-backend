@@ -110,7 +110,7 @@ async def search_kb(state: AgentState, query: str = "", sku: Optional[str] = Non
     name = state.resolved.name if state.resolved else ""
     chunks = await kb.search_kb(query, sku=sku, doc_type=doc_type, k=k, product_name=name)
     return {"found": bool(chunks), "count": len(chunks),
-            "passages": [{"text": c.get("text", "")[:900], "title": c.get("title", ""),
+            "passages": [{"text": (c.get("text") or "")[:900], "title": c.get("title", ""),
                           "url": c.get("url", ""), "section": c.get("section", ""),
                           "page": c.get("page"), "sku": c.get("sku"),
                           "score": round(c.get("score", 0), 3)} for c in chunks]}
@@ -204,17 +204,29 @@ async def check_warranty(
     order_found: bool = False, dealer_matched: bool = False, proof_present: bool = False,
 ) -> Dict[str, Any]:
     sku = sku or (state.resolved.sku if state.resolved else None)
+    # Term precedence: this product's own warranty beats its category's default.
+    #
+    # It used to be the other way round — the product term was read and then
+    # unconditionally overwritten by the category policy, so the specific fact lost to
+    # the generic one. 232 products disagree with their category: every Anker SOLIX
+    # power station carries 60 months against a `power_station` default of 24, and the
+    # agent quoted 24. Eight products go the other way (12 against an 18-month default),
+    # which is the dangerous direction — promising a year of coverage that does not
+    # exist. The category row stays the fallback for products with no term of their own,
+    # and remains the only source of `covers`/`excludes`.
     category, term = None, warranty.DEFAULT_TERM_MONTHS
+    product_term: Optional[int] = None
     if sku:
         row = await products.get_product(sku)
         if row:
             category = row.get("category")
-            term = row.get("warranty_months") or term
+            product_term = row.get("warranty_months")
     if category:
         policy = await kb.db.fetch_one(
             "select months from warranty_policies where category = %s", (category,))
         if policy:
             term = policy["months"]
+    term = product_term or term
 
     # Damage class from the photo when the planner did not supply one.
     if not damage_class:

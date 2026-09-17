@@ -88,23 +88,46 @@ async def main() -> int:
         # kb_articles without anyone running embed_corpus, and this script reported PASS
         # while 81% of the knowledge base was unreachable by search. Both directions have
         # to be checked, because each one is silent about the other's failure.
+        # `embed_status` is set by scripts/triage_kb_corpus.py: `chrome` rows are
+        # navigation rails and link lists, `non_english` rows are localised storefronts.
+        # Those are excluded ON PURPOSE, so counting them as "never embedded" would make
+        # this gate fail for doing its job. But they are printed rather than filtered out
+        # silently — an audit that quietly drops rows from its own denominator is exactly
+        # how 81% of the corpus went missing while this script said PASS.
+        triage = await db.fetch(
+            "select coalesce(embed_status, 'keep') as verdict, count(*) as n "
+            "from kb_articles group by 1 order by n desc")
+        print("\ntriage verdicts:")
+        for row in triage:
+            print(f"  {row['verdict']:<14} {row['n']}")
+
+        eligible = await db.fetch_one(
+            """
+            select count(*) as n
+            from kb_articles ka
+            where length(coalesce(ka.clean_body, ka.body)) > 100
+              and coalesce(ka.embed_status, 'keep') = 'keep'
+            """
+        )
         unindexed = await db.fetch_one(
             """
             select count(*) as n
             from kb_articles ka
-            where length(ka.body) > 100
+            where length(coalesce(ka.clean_body, ka.body)) > 100
+              and coalesce(ka.embed_status, 'keep') = 'keep'
               and not exists (select 1 from kb_chunks kc where kc.article_id = ka.id)
             """
         )
+        n_eligible = int(eligible["n"])
         missing = int(unindexed["n"])
-        indexed = int(articles["n"]) - missing
-        print(f"\narticles with a body:  {articles['n']}")
+        indexed = n_eligible - missing
+        print(f"\neligible articles:     {n_eligible}")
         print(f"reached the index:     {indexed}")
         print(f"never embedded:        {missing} "
-              f"({missing / articles['n'] * 100:.0f}% of the corpus)"
-              if articles["n"] else "")
+              f"({missing / n_eligible * 100:.0f}% of the eligible corpus)"
+              if n_eligible else "")
 
-        if missing > articles["n"] * 0.02:
+        if missing > n_eligible * 0.02:
             print(
                 "\nFAIL: these articles exist in Postgres and cannot be retrieved. "
                 "Search silently answers as if they were never collected."

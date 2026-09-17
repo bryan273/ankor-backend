@@ -8,10 +8,16 @@ and drive it under an event loop we chose.
 
 The symptom this prevents is nasty precisely because it is not an exception: the pool
 just never opens, and thirty seconds later every database call reports a closed pool.
+
+It doubles as the container entry point. `PORT` is injected by every platform worth
+deploying this to (Cloud Run, Fly, Render, Railway) and a container that binds 127.0.0.1
+is unreachable from outside itself — so both are read from the environment, with the dev
+values as defaults so running it locally is unchanged.
 """
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 
 import uvicorn
@@ -21,7 +27,10 @@ from app.config import settings
 
 def main() -> None:
     config = uvicorn.Config(
-        "app.main:app", host="127.0.0.1", port=8000, reload=False,
+        "app.main:app",
+        host=os.getenv("HOST", "127.0.0.1"),
+        port=int(os.getenv("PORT", "8000")),
+        reload=False,
         log_level=settings.log_level.lower(),
         loop="none",  # do not let uvicorn install a policy over ours
     )

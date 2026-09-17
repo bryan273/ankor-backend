@@ -1,0 +1,31 @@
+# Keep secrets and local state out of the image. `.env` is the important line: the image
+# is a tarball anyone with registry access can unpack, and a key baked into a layer stays
+# there even if a later layer deletes it. Configuration is injected at deploy time.
+.env
+.env.*
+.secrets/
+
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+.git/
+.github/
+.gitignore
+
+.tmp/
+_s.py
+*.log
+logs/
+data/
+.localvec/
+
+tests/
+docs/
+README.md
+*.md

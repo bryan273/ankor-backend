@@ -41,3 +41,7 @@ logs/
 
 # local vector index (regenerable)
 .localvec/
+
+# scratch probes (session-local, never part of the build)
+.tmp/
+_s.py
