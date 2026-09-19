@@ -86,7 +86,7 @@ After "battery swelling, burning smell", the follow-up "can I still use it until
 - **A SKU passed as an order number** ("T2080111") no longer hides the customer's real order.
 - **Engine:** when the customer's own purchase date is already past the term, the verdict is `expired` (proof can't change it), not "send to a human".
 - **Composer:** no vouching for authenticity, no quoting policy that no tool gave, "a person will pick it up within X", never "you're with a person now", and soundcore/eufy are Anker brands.
-- **Catalogue vs the live store** (`scripts/audit_catalogue_vs_site.py`, 1,491 rows): 32 prices differ, about 40 are missing, 4 pages are gone, and 40 rows are in the wrong category. The fix is ready as `scripts/fix_catalogue_data.py` (dry run by default, backup and `--restore`), but it has **not been applied**: it writes to the shared Supabase.
+- **Catalogue vs the live store** (`scripts/audit_catalogue_vs_site.py`, 1,491 rows): 32 prices differ, about 40 are missing, 4 pages are gone, and 40 rows are in the wrong category. Fixed with `scripts/fix_catalogue_data.py`, applied 2026-09-19 (backup `logs/data_fix_backup_20260919_232655.json`, undo with `--restore`): 40 categories, 62 prices, 6 statuses, 42 duplicate flows, the duplicate SE-482911 line, and 33 misattributed error codes. Duplicate dealers are kept on purpose: `dealer_orders` is UNIQUE (dealer_id, order_no), so two-item invoices need both copies. After the fix: 29/30 conversations, 27/27 scenarios.
 - Still open: c15, where the KB line about warranty registration was read as "no receipt needed" (1 of 30).
 
 ---

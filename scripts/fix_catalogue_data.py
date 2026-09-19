@@ -118,12 +118,11 @@ async def plan(audit: list) -> dict:
     for sku in NOT_PRODUCTS:
         steps["status"].append((sku, "active", "invalid"))
 
-    dealers = await db.fetch("select id::text, name from dealers order by name, id")
-    keep: dict = {}
-    for d in dealers:
-        keep.setdefault(d["name"], d["id"])
-        if keep[d["name"]] != d["id"]:
-            steps["dealers"].append((d["id"], keep[d["name"]], d["name"]))
+    # Dealers are NOT merged, although every one exists twice. `dealer_orders` is
+    # UNIQUE (dealer_id, order_no) with one product per row, so a two-item invoice
+    # (GM774120: earbuds + a speaker) can only exist as one line on each copy of the
+    # dealer. Merging them violates the constraint, and dropping a line loses a real
+    # item. The lookup already reads all lines across both copies.
 
     flows = await db.fetch("""
         select id::text, product_id::text, symptom, steps::text as steps
