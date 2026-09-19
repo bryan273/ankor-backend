@@ -42,6 +42,11 @@ RERANK_PROMPT = """Rank these documentation passages by how directly they answer
 support question. A passage that names the exact symptom and gives an action beats one \
 that merely mentions the product.
 
+The customer's device: {product}. Each passage is labelled with the article it comes \
+from. Drop a passage written for a different KIND of device (a handheld or stick vacuum \
+when they have a robot vacuum, a bottle washer when they have a breast pump). Rank a \
+passage for their exact model above one for a sibling model.
+
 Question: {question}
 
 Passages:
@@ -91,7 +96,8 @@ async def vector_search(
 RERANK_WINDOW = 24
 
 
-async def rerank(question: str, passages: List[Dict[str, Any]], k: int = 6) -> List[Dict[str, Any]]:
+async def rerank(question: str, passages: List[Dict[str, Any]], k: int = 6,
+                 product: str = "") -> List[Dict[str, Any]]:
     """Listwise LLM rerank, but only when the scores are close enough to be worth it.
 
     If the top result is clearly ahead of the pack, an extra model call buys nothing
@@ -105,14 +111,17 @@ async def rerank(question: str, passages: List[Dict[str, Any]], k: int = 6) -> L
         return passages[:k]
 
     listing = "\n\n".join(
-        f"[{i}] {(p.get('title') or p.get('section') or 'passage')}: "
+        f"[{i}] {(p.get('title') or p.get('section') or 'passage')} "
+        f"(article: {_from_slug(p.get('url')) or 'unknown'}): "
         f"{(p.get('text') or '')[:400]}"
         for i, p in enumerate(passages[:RERANK_WINDOW])
     )
     try:
         data, usage = await get_llm().json_complete(
             [{"role": "user", "content": RERANK_PROMPT.format(
-                question=question, passages=listing, k=k)}],
+                question=question, passages=listing, k=k,
+                product=product or "not identified yet, so infer the kind of device "
+                                   "from the question")}],
             max_tokens=1200, default={"ranked": []},
         )
         order = [i for i in data.get("ranked", []) if isinstance(i, int) and 0 <= i < len(passages)]
@@ -182,8 +191,11 @@ async def search_kb(
     if not candidates and sku:
         # The SKU filter can be too tight when a manual chunk was indexed against a
         # product family rather than a variant. Retry unfiltered before giving up.
+        # In practice this is the normal path: the vectors' `sku` field is empty across
+        # the index and only 296 of 14,799 articles link to a product, so the filtered
+        # query returns nothing and `same_model` below does the real narrowing.
         log.info("kb.filter_relaxed", sku=sku)
-        candidates = await vector_search(search_text, NS_KB, top_k=25)
+        candidates = await vector_search(search_text, NS_KB, top_k=40)
 
     usable = [c for c in candidates if c.get("score", 0) >= MIN_RELEVANCE]
     if not usable:
@@ -205,9 +217,45 @@ async def search_kb(
     # Only the first RERANK_WINDOW are ever shown to the model, and when rerank is
     # skipped it returns `passages[:k]` with k well under that — so hydrating the whole
     # 40-candidate set fetches rows nothing can reach. Measured at 0.74s for 40 rows.
+    usable = same_model(usable, product_name)
     hydrated = await _hydrate(usable[:RERANK_WINDOW])
-    ranked = await rerank(query, hydrated, k=k * 2)
+    ranked = await rerank(query, hydrated, k=k * 2, product=product_name)
     return diversify(ranked, k)
+
+
+# Units and pack counts look like model numbers ("440W", "2×") and are not.
+_NOT_A_MODEL = re.compile(r"^\d+(w|wh|kwh|mah|v|a|in|ft|m|x|×|pcs|pack|ports?)$")
+
+
+def model_tokens(name: str) -> List[str]:
+    """The model identifiers in a product name: `F3800`, `S1`, `A1761`, `X10`."""
+    out = []
+    for tok in re.findall(r"[a-z0-9]+", (name or "").lower()):
+        if re.search(r"\d", tok) and re.search(r"[a-z]", tok) and not _NOT_A_MODEL.match(tok):
+            out.append(tok)
+    return out
+
+
+def same_model(passages: List[Dict[str, Any]], product_name: str) -> List[Dict[str, Any]]:
+    """Keep only the passages written for this model, when any exist.
+
+    A SOLIX F3800 Plus owner was given the reset steps from the F2000 manual. The F3800
+    guide was in the candidates too, one hundredth lower. The SKU filter should have
+    decided this, and it cannot: see the relaxed retry above. So the model number in
+    the article's title or URL decides it instead. With no passage for this model, all
+    of them are kept, and the reranker is told the device so it can prefer the closest.
+    """
+    tokens = [t for t in model_tokens(product_name) if len(t) >= 3]
+    if not tokens:
+        return passages
+    def names_it(p: Dict[str, Any]) -> bool:
+        where = f"{p.get('title') or ''} {p.get('url') or ''}".lower()
+        return any(re.search(rf"(?<![a-z0-9]){re.escape(t)}(?![0-9])", where) for t in tokens)
+    exact = [p for p in passages if names_it(p)]
+    if exact:
+        log.info("kb.same_model", tokens=tokens, kept=len(exact), of=len(passages))
+        return exact
+    return passages
 
 
 # 4,826 of the 8,071 indexed articles — 60% — carry one of three site-chrome titles

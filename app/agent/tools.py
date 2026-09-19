@@ -179,17 +179,29 @@ async def lookup_order(state: AgentState, order_no: Optional[str] = None,
     # up by email returned the customer's LATEST order — for budi.tanaka8 a refurbished
     # charger from 2025 — and the engine then ruled on the charger: "covered until
     # 2026-12-10" for a vacuum whose warranty ended in 2025.
-    if not order_no and state.customer_id and state.resolved:
+    async def own_order_for_product() -> Optional[str]:
         owned = [r for r in await orders.customer_orders(state.customer_id, limit=25)
                  if r.get("sku") == state.resolved.sku]
-        if not owned:
+        return owned[0]["order_no"] if owned else None
+
+    if not order_no and state.customer_id and state.resolved:
+        order_no = await own_order_for_product()
+        if not order_no:
             return {"found": False, "reason": "no_order_for_this_product",
                     "product": state.resolved.name,
                     "hint": "This customer's account has no order for this product. Ask "
                             "where they bought it, or for the order number / receipt."}
-        order_no = owned[0]["order_no"]
 
     result = await orders.lookup_order(order_no, email, phone)
+    if not result.get("found") and order_no and state.customer_id and state.resolved:
+        # The model sometimes passes the product's SKU as the order number ("T2080111").
+        # That finds nothing, and the customer was told "no purchase record on file" for
+        # a vacuum sitting in their own order history. A number that finds nothing is
+        # not a reason to ignore the account.
+        mine = await own_order_for_product()
+        if mine and mine != order_no:
+            log.info("orders.fallback_to_own_order", tried=order_no[:20])
+            result = await orders.lookup_order(mine, email, phone)
     if (result.get("found") and state.customer_id
             and (result["order"].get("customer_id") or state.customer_id) != state.customer_id):
         # Signed in as one customer, asking about another customer's order.
@@ -512,10 +524,14 @@ def summarise(tool: str, data: Dict[str, Any]) -> str:
     if tool in ("lookup_order", "lookup_dealer_order"):
         if data.get("found"):
             dealer = (data.get("dealer") or {}).get("name")
-            items = [i.get("name") for i in (data.get("items") or []) if i.get("name")]
+            # Whole names, with the SKU. Cut at 40 characters, "2× SOLIX F3800 Plus + 2×
+            # Expansion Battery + Smart Home Power Panel…" lost the power panel and the SKU,
+            # and the reply that mentioned both read as invented to anyone checking it.
+            items = [f"{i['name'][:120]}" + (f" ({i['sku']})" if i.get("sku") else "")
+                     for i in (data.get("items") or []) if i.get("name")]
             return (f"found {data.get('order_no', '')}"
                     + (f" · dealer {dealer}" if dealer else "")
-                    + (f" · items: {', '.join(n[:40] for n in items[:3])}" if items else "")
+                    + (f" · items: {'; '.join(items[:3])}" if items else "")
                     + (f" · bought {data['purchase_date']}" if data.get("purchase_date") else ""))
         if data.get("reason") in ("not_your_account", "not_on_your_account"):
             return "not on this customer's account"

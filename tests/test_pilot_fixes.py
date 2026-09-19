@@ -215,3 +215,68 @@ def test_foreign_brand_in_photo_is_called_out():
 def test_other_category_vocabulary_is_detected():
     assert graph._talks_about_other_category("ok back to the earbuds, reset which?", "power_bank")
     assert not graph._talks_about_other_category("is it still under warranty?", "robot_vacuum")
+
+
+# ── retrieval: the right model's manual ───────────────────────────────────────
+
+def test_model_tokens_skip_units_and_counts():
+    from app.services.kb import model_tokens
+    name = "2× Anker SOLIX F3800 Plus + 2× Expansion Battery + 8× 440W Rigid Solar Panel"
+    assert model_tokens(name) == ["f3800"]
+
+
+def test_same_model_prefers_exact_manual_over_sibling():
+    from app.services.kb import same_model
+    passages = [
+        {"title": "Anker SOLIX F2000 Portable Power Station", "url": "x/F2000-USER-MANUAL"},
+        {"title": "Anker SOLIX F3800 Portable Power Station USER GUIDE", "url": "x/F3800-UK"},
+    ]
+    kept = same_model(passages, "Anker SOLIX F3800 Plus")
+    assert [p["url"] for p in kept] == ["x/F3800-UK"]
+
+
+def test_same_model_keeps_all_when_no_exact_manual():
+    from app.services.kb import same_model
+    passages = [{"title": "F2000 manual", "url": "a"}, {"title": "C800 guide", "url": "b"}]
+    assert same_model(passages, "Anker SOLIX F3800 Plus") == passages
+    assert same_model(passages, "") == passages
+
+
+def test_same_model_token_is_not_a_prefix_match():
+    from app.services.kb import same_model
+    passages = [{"title": "X10 Pro Omni guide", "url": "a"}, {"title": "X100 guide", "url": "b"}]
+    assert [p["url"] for p in same_model(passages, "eufy X10 Pro Omni")] == ["a"]
+
+
+def test_power_station_phrase_names_the_category():
+    from app.services.products import category_from_symptom
+    assert category_from_symptom("my power station won't charge from the wall anymore") \
+        == "power_station"
+
+
+# ── warranty: the customer's own date already out of term ─────────────────────
+
+def test_stated_date_out_of_term_is_expired_without_proof():
+    from datetime import date
+    from app.services import warranty as w
+    d = w.decide(w.WarrantyInput(sku="T2080111", category="robot_vacuum",
+                                 purchase_date=w.parse_date("2024-04"), term_months=12),
+                 today=date(2026, 9, 19))
+    assert d.verdict == w.Verdict.EXPIRED
+    assert d.reason_code == "OUT_OF_TERM_BY_STATED_DATE"
+
+
+def test_stated_date_in_term_still_needs_evidence():
+    from datetime import date
+    from app.services import warranty as w
+    d = w.decide(w.WarrantyInput(sku="T2080111", category="robot_vacuum",
+                                 purchase_date=w.parse_date("2026-06-01"), term_months=12),
+                 today=date(2026, 9, 19))
+    assert d.verdict == w.Verdict.ESCALATE_HUMAN
+
+
+def test_month_only_date_reads_as_last_day():
+    from datetime import date
+    from app.services.warranty import parse_date
+    assert parse_date("2024-04") == date(2024, 4, 30)
+    assert parse_date("2024-12") == date(2024, 12, 31)

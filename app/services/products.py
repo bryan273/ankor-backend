@@ -33,7 +33,8 @@ CATEGORY_SIGNALS: Dict[str, List[str]] = {
     "charger": ["usb-c", "usb c", "wall plug", "gan", "watt", "charging brick", "power delivery",
                 "socket", "outlet", "charge my phone"],
     "power_bank": ["power bank", "portable charger", "mah", "recharge on the go"],
-    "power_station": ["solar", "camping", "generator", "inverter", "blackout", "kwh"],
+    "power_station": ["power station", "powerhouse", "solix", "solar", "camping", "generator",
+                      "inverter", "blackout", "kwh"],
     "audio": ["earbuds", "headphones", "bass", "anc", "noise cancelling", "pairing", "bluetooth",
               "left earbud", "right earbud", "soundstage"],
     "security_camera": ["motion detection", "night vision", "footage", "doorbell", "homebase",
@@ -237,6 +238,38 @@ async def owned_products(customer_id: Optional[str], candidate_ids: List[str]) -
     return [r["product_id"] for r in rows]
 
 
+async def owned_in_category(customer_id: Optional[str], text: str) -> Optional[Dict[str, Any]]:
+    """The one device of this kind the signed-in customer owns, if exactly one.
+
+    "My power station won't charge" names no model, and the alias table has no entry for
+    a phrase that generic, so disambiguation used to end at no_match. The customer had
+    bought exactly one power station, and the agent answered from the F2000 manual and
+    asked "which model do you have?". Their orders already said.
+
+    Spare parts, accessories and gift cards are not the device the customer means:
+    Nadia's account holds a SOLIX gift card filed under power_station.
+    """
+    category = category_from_symptom(text)
+    if not customer_id or not category:
+        return None
+    rows = await db.fetch(
+        """
+        select distinct p.id::text as product_id, p.sku, p.name, p.brand, p.category,
+               p.hero_image, p.price, p.status
+        from order_items oi
+        join orders o on o.id = oi.order_id
+        join products p on p.id = oi.product_id
+        where o.customer_id = %s and p.category = %s and p.status <> 'invalid'
+          and p.name !~* '(gift card|replacement|spare|filter|brush|bag|cable|case|ear tips|mount)'
+        """,
+        (customer_id, category),
+    )
+    if len(rows) == 1:
+        log.info("products.owned_in_category", category=category, sku=rows[0]["sku"])
+        return rows[0]
+    return None
+
+
 def category_from_symptom(text: str) -> Optional[str]:
     """Which product category the customer's own words point at, if exactly one.
 
@@ -438,6 +471,9 @@ async def disambiguate(
                 candidates.append(row)
 
     if not candidates:
+        owned = await owned_in_category(customer_id, " ".join(mentions or []) + " " + current)
+        if owned:
+            return owned, [owned], "purchase_history"
         return None, [], "no_match"
 
     owned = await owned_products(customer_id, [c["product_id"] for c in candidates])
@@ -452,6 +488,9 @@ async def disambiguate(
     # customer's own purchase (above) may pin a SKU from a generic phrase.
     if not any(_has_model_token(m) for m in mentions or []):
         log.info("products.generic_mention", mentions=mentions, n=len(candidates))
+        owned = await owned_in_category(customer_id, " ".join(mentions or []) + " " + current)
+        if owned:
+            return owned, [owned], "purchase_history"
         return None, [], "generic"
 
     if len(candidates) == 1:

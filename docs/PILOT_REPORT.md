@@ -7,8 +7,8 @@
 | | Before | After |
 |---|---|---|
 | Original scenario suite (27 cases) | 27/27 | **27/27** (no regression) |
-| **Multi-turn conversations (30 new, 64 turns)** | **12/30** | **25/30** (two clean runs, stable) |
-| Unit tests | 213 | **238** (+25 regression tests for what this pilot found) |
+| **Multi-turn conversations (30 new, 64 turns)** | **12/30** | **29/30** (final run; earlier clean runs 25–27/30) |
+| Unit tests | 213 | **246** (+33 regression tests for what this pilot found) |
 | Warranty answers matching the rule engine (judge, 0–5) | 1.12¹ | **4.75** |
 | Memory across turns (judge, 0–5) | 3.93¹ | **4.26** |
 
@@ -80,6 +80,15 @@ After "battery swelling, burning smell", the follow-up "can I still use it until
 - **Chinese text could crash a turn on Windows.** structlog writing CJK to a cp1252 console threw an exception *inside the request being logged*. `run.py` now forces UTF-8.
 - **Proxy trap.** With Clash on as the Windows system proxy, `httpx` sends even `127.0.0.1` into the proxy and gets a 502, and the server never sees the request. The new harness uses `trust_env=False`, as `eval_run.py` already did.
 
+### Second pass (same day)
+- **The SKU filter never worked.** The `sku` field is empty on every vector, and only 296 of 14,799 KB articles link to a product, so every filtered search returned nothing and fell back to unfiltered, which is how the F3800 owner got the F2000 manual. Retrieval now keeps passages whose title or URL names the customer's model (`kb.same_model`), and the reranker is told the device, so a HomeVac article no longer answers a robot-vacuum question.
+- **"My power station" for a signed-in owner** resolves to the one power station on their account.
+- **A SKU passed as an order number** ("T2080111") no longer hides the customer's real order.
+- **Engine:** when the customer's own purchase date is already past the term, the verdict is `expired` (proof can't change it), not "send to a human".
+- **Composer:** no vouching for authenticity, no quoting policy that no tool gave, "a person will pick it up within X", never "you're with a person now", and soundcore/eufy are Anker brands.
+- **Catalogue vs the live store** (`scripts/audit_catalogue_vs_site.py`, 1,491 rows): 32 prices differ, about 40 are missing, 4 pages are gone, and 40 rows are in the wrong category. The fix is ready as `scripts/fix_catalogue_data.py` (dry run by default, backup and `--restore`), but it has **not been applied**: it writes to the shared Supabase.
+- Still open: c15, where the KB line about warranty registration was read as "no receipt needed" (1 of 30).
+
 ---
 
 ## Insights for the company
@@ -108,7 +117,6 @@ After "battery swelling, burning smell", the follow-up "can I still use it until
 
 | Item | Why not fixed now |
 |---|---|
-| Retrieval falls back to a sibling model's manual (F2000 for F3800) | Needs a retrieval-precision change in `kb.search_kb`; it has to be A/B tested, not patched blind |
 | Vision misreads small logos ("uni" read as "AENZR") | Limitation of the DeepSeek vision model; the reply still says "not our product" |
 | The duplicated rows and mis-categorised parts listed in insight 4 | They live in the shared Supabase, so deleting or moving rows is the team's call. Code now tolerates the duplicates |
 | The KB line about warranty registration was read as "no receipt needed" | Only happened in 1 of the 30 conversations; watch it rather than special-case it |

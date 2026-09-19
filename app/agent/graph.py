@@ -1261,6 +1261,16 @@ def _blocks_from_state(state: AgentState) -> List[Block]:
             ticket_id=d.get("ticket_no", ""), status=d.get("status", "open"),
             priority=d.get("priority", "normal"), summary=d.get("summary", ""),
             eta=d.get("eta")).model_dump()))
+    elif (state.open_ticket.get("ticket_no")
+          and state.perception.intent in (Intent.ESCALATE_REQUEST, Intent.COMPLAINT)):
+        # "Just get someone to sort it out" one turn after the ticket was opened. The
+        # ticket is reused, not duplicated, so no tool runs and no card appeared: the
+        # customer asked for a person and saw only text. Show the ticket they already have.
+        t = state.open_ticket
+        blocks.append(Block(type=BlockType.TICKET_STATUS, payload=TicketStatusPayload(
+            ticket_id=t.get("ticket_no", ""), status="open",
+            priority=t.get("priority") or "normal", summary=t.get("summary", ""),
+            eta=t.get("eta")).model_dump()))
 
     search = state.observation_by_tool("search_products")
     if search and state.perception.intent in (Intent.BUY_ADVICE, Intent.PRODUCT_QUESTION):

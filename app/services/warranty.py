@@ -268,6 +268,19 @@ def decide(inp: WarrantyInput, today: Optional[date] = None) -> WarrantyDecision
             next_action="start_claim", warranty_until=expiry, months_remaining=remaining,
         )
 
+    # 4a. No proof, but the customer's OWN date is already past the term. Proof can only
+    # confirm the date they gave, so it cannot change the answer: "bought April 2024" on
+    # a 12-month vacuum was sent to a human for missing proof, and the reply improvised
+    # "right at the edge" about a warranty that closed in April 2025.
+    if not inp.order_found and not inp.proof_present and in_term is False:
+        return WarrantyDecision(
+            Verdict.EXPIRED, "OUT_OF_TERM_BY_STATED_DATE",
+            "By the purchase date the customer gave, the coverage window has already "
+            "closed, so no receipt would change the answer.",
+            next_action="offer_paid_repair", warranty_until=expiry,
+            months_remaining=remaining,
+        )
+
     # 4. Nothing identifies the purchase. Escalate rather than guess.
     if not inp.order_found and not inp.proof_present:
         return WarrantyDecision(
@@ -348,4 +361,11 @@ def parse_date(value: Any) -> Optional[date]:
             return datetime.strptime(str(value)[:10], fmt).date()
         except ValueError:
             continue
-    return None
+    # "2024-04": a month the customer remembers. Take its LAST day, the reading most
+    # favourable to them, so a month-only date never expires a warranty early.
+    try:
+        first = datetime.strptime(str(value)[:7], "%Y-%m").date()
+        nxt = date(first.year + first.month // 12, first.month % 12 + 1, 1)
+        return nxt - timedelta(days=1)
+    except ValueError:
+        return None
