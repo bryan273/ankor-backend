@@ -18,6 +18,10 @@ from app.clients import db
 def configure_logging() -> None:
     logging.basicConfig(format="%(message)s", stream=sys.stdout,
                         level=getattr(logging, settings.log_level.upper(), logging.INFO))
+    # httpx logs every request line at INFO — full URL, query string included. Any client
+    # that authenticates by query parameter puts its secret in the log that way. Belt and
+    # braces with the header change in clients/embed.py.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     structlog.configure(
         processors=[
             structlog.contextvars.merge_contextvars,

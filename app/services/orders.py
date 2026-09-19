@@ -107,7 +107,12 @@ async def lookup_dealer_order(order_no: str,
     if not order_no:
         return {"found": False, "reason": "no_order_no"}
 
-    row = await db.fetch_one(
+    # All rows, not one. A dealer invoice can carry several products (SE-193044 is a
+    # cable organiser AND a Nano charger), and `fetch_one` returned whichever came first
+    # — so a customer asking about the charger on GM774120 was told "the product on that
+    # invoice is a speaker, not a charger". Exact duplicate rows (the double import) are
+    # collapsed on the product.
+    rows = await db.fetch(
         """
         select dord.order_no, dord.purchase_date, dord.customer_ref, d.name as dealer_name,
                d.region, d.contact, d.service_path, d.authorized, d.id::text as dealer_id,
@@ -117,11 +122,21 @@ async def lookup_dealer_order(order_no: str,
         join dealers d on d.id = dord.dealer_id
         left join products p on p.id = dord.product_id
         where upper(dord.order_no) = upper(%s)
+        order by dord.purchase_date, p.name
         """,
         (order_no,),
     )
-    if row:
-        return {"found": True, "match": "exact_invoice", "dealer_order": row}
+    if rows:
+        items, seen = [], set()
+        for r in rows:
+            if r.get("sku") in seen:
+                continue
+            seen.add(r.get("sku"))
+            items.append({"sku": r.get("sku"), "name": r.get("product_name"),
+                          "category": r.get("category"),
+                          "warranty_months": r.get("warranty_months")})
+        return {"found": True, "match": "exact_invoice", "dealer_order": rows[0],
+                "items": items}
 
     if dealer_hint:
         dealer = await db.fetch_one(

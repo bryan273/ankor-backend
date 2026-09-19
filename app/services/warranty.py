@@ -56,7 +56,11 @@ class WarrantyInput:
     channel: Channel = Channel.UNKNOWN
     damage_class: DamageClass = DamageClass.UNKNOWN
     order_found: bool = False
+    # True only when the invoice itself was FOUND in the dealer directory — a record,
+    # not a number that merely looks like one of that dealer's invoices.
     dealer_matched: bool = False
+    # From the dealer directory. None = no dealer involved / unknown.
+    dealer_authorized: Optional[bool] = None
     proof_present: bool = False
     term_months: int = DEFAULT_TERM_MONTHS
     safety_concern: bool = False
@@ -119,13 +123,51 @@ def decide(inp: WarrantyInput, today: Optional[date] = None) -> WarrantyDecision
             next_action="escalate_urgent", warranty_until=expiry, months_remaining=remaining,
         )
 
+    # 0b. Accidental damage and consumable wear are outside the warranty whatever the
+    # purchase details — no receipt is needed to know that, and asking for one first
+    # sends the customer to fetch paperwork for an answer that cannot change.
+    if inp.damage_class == DamageClass.PHYSICAL_DAMAGE:
+        return WarrantyDecision(
+            Verdict.NOT_COVERED_POLICY, "PHYSICAL_DAMAGE_EXCLUDED",
+            "Accidental damage — a drop, a crack, liquid getting in — sits outside the "
+            "warranty however and wherever it was bought. A paid repair is the route.",
+            next_action="offer_paid_repair", warranty_until=expiry, months_remaining=remaining,
+        )
+    if inp.damage_class == DamageClass.WEAR:
+        return WarrantyDecision(
+            Verdict.NOT_COVERED_POLICY, "CONSUMABLE_WEAR",
+            "Consumable parts like brushes, filters and ear tips wear out by design, so "
+            "they are replacement items rather than warranty claims.",
+            next_action="offer_replacement_part", warranty_until=expiry,
+            months_remaining=remaining,
+        )
+
     # 1. Dealer channel — scenario S3.
     if inp.channel == Channel.DEALER or (not inp.order_found and inp.dealer_matched):
-        if inp.dealer_matched and inp.proof_present:
+        # The directory says who the seller is, and an unauthorised seller carries no
+        # manufacturer warranty however good the invoice looks. This input did not
+        # exist, so an invoice from "Grey Market Imports" (authorized = false in the
+        # directory) came out `covered_via_dealer` — the one verdict the dealer record
+        # itself contradicts.
+        if inp.dealer_authorized is False:
+            return WarrantyDecision(
+                Verdict.NOT_COVERED_POLICY, "UNAUTHORISED_DEALER",
+                "This was bought from a seller that is not an authorised Anker dealer, so "
+                "the manufacturer warranty does not apply. The claim goes to the seller; "
+                "a paid repair from us is still available.",
+                next_action="offer_paid_repair", warranty_until=expiry,
+                months_remaining=remaining,
+            )
+        # A dealer invoice FOUND in the directory is the purchase record — the same
+        # standing an order on file has for the official store. Demanding an invoice
+        # photo on top of a record we already hold answered the brief's S3 case ("the
+        # order isn't in the system — is it a dealer order, and can it be covered?")
+        # with "upload proof" instead of an answer.
+        if (inp.dealer_matched or inp.proof_present) and in_term is not None:
             if in_term is False:
                 return WarrantyDecision(
                     Verdict.EXPIRED, "DEALER_ORDER_OUT_OF_TERM",
-                    "The dealer invoice checks out, but the coverage window has closed.",
+                    "The dealer record checks out, but the coverage window has closed.",
                     next_action="offer_paid_repair", warranty_until=expiry,
                     months_remaining=remaining,
                 )
@@ -138,7 +180,7 @@ def decide(inp: WarrantyInput, today: Optional[date] = None) -> WarrantyDecision
                 )
             return WarrantyDecision(
                 Verdict.COVERED_VIA_DEALER, "DEALER_VERIFIED",
-                "The dealer is an authorised partner and the invoice is in term, so this "
+                "The dealer is an authorised partner and the purchase is in term, so this "
                 "is covered — handled through that dealer's service channel.",
                 next_action="route_to_dealer", warranty_until=expiry, months_remaining=remaining,
             )
@@ -151,8 +193,14 @@ def decide(inp: WarrantyInput, today: Optional[date] = None) -> WarrantyDecision
             next_action="upload_proof", warranty_until=expiry, months_remaining=remaining,
         )
 
-    # 2. Official store — the purchase record itself is the proof.
-    if inp.channel == Channel.OFFICIAL_STORE and inp.order_found:
+    # 2. An order ON FILE — the purchase record itself is the proof.
+    #
+    # Marketplace orders included: when the order is in our own table, "marketplace
+    # orders do not appear in this system, send the invoice" was false on its face — the
+    # agent had just shown the customer that order on a card, then asked them to prove
+    # it existed. The marketplace branch below is for orders we do NOT hold.
+    if inp.order_found and inp.channel in (Channel.OFFICIAL_STORE, Channel.MARKETPLACE,
+                                           Channel.AMAZON):
         if in_term is False:
             return WarrantyDecision(
                 Verdict.EXPIRED, "OUT_OF_TERM",

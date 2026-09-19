@@ -18,6 +18,7 @@ import asyncio
 import json
 import re
 import time
+import uuid
 from typing import Any, Dict, List, Optional
 
 import structlog
@@ -101,6 +102,12 @@ class Agent:
             # output. Running them in sequence spent a whole round trip for nothing, and
             # on a 3-lane key pool a round trip is seconds the customer is watching.
             await asyncio.gather(self._rewrite(state), self._perceive(state))
+            if state.perception.fix_failed:
+                await self._count_failure(state)
+            if state.safety_case:
+                # Stays a safety conversation; the policy table then keeps it calm,
+                # question-free and upsell-free, and the engine keeps escalating it.
+                state.perception.safety_concern = True
             paused = await self._disambiguate(state)
             if paused:
                 return state
@@ -112,6 +119,13 @@ class Agent:
                                     retryable=True)
             raise
         return state
+
+    async def _count_failure(self, state: AgentState) -> None:
+        state.failed_attempts += 1
+        try:
+            await session_svc.set_meta(state.session_id, "failed_attempts", state.failed_attempts)
+        except Exception as e:  # noqa: BLE001 — the count is advisory, never a gate
+            log.warning("agent.failed_attempts_persist", error=str(e))
 
     async def resume(self, state: AgentState, action_id: str,
                      value: Dict[str, Any]) -> AgentState:
@@ -130,6 +144,9 @@ class Agent:
                 call_id="resume", tool=f"step_result_{outcome}", ok=True,
                 summary=f"customer reports: {outcome}",
                 data={"outcome": outcome, "step_id": value.get("step_id")}))
+            if outcome == "failed":
+                state.perception.fix_failed = True
+                await self._count_failure(state)
             state.user_message = {
                 "worked": "That fixed it.",
                 "failed": "I tried that and it still isn't working.",
@@ -212,13 +229,27 @@ class Agent:
                                                            "has_deadline": False}})
         await self._step_start("answer", label="This one needs immediate attention")
 
+        # Announced like any other call — the ticket number in the reply must be visibly
+        # backed by a tool that ran, or it reads (to a customer and to an auditor) as made up.
+        call_id = f"call_safety_{uuid.uuid4().hex[:6]}"
+        await self.stream.emit(Event.TOOL_CALL, {
+            "call_id": call_id, "tool": "create_ticket",
+            "label": "Opening an urgent ticket", "args_preview": "safety escalation"})
         result = await tools.run_tool(state, "create_ticket", {
             "summary": f"SAFETY: {state.user_message[:160]}",
-            "priority": "urgent", "reason": "safety keywords detected"})
+            "priority": "urgent", "reason": "safety keywords detected"}, call_id=call_id)
         state.observations.append(result)
         self._trace(result)
+        await self.stream.emit(Event.TOOL_RESULT, {
+            "call_id": result.call_id, "ok": result.ok, "ms": result.ms,
+            "summary": result.summary})
         if result.ok:
             state.ticket_id = result.data.get("ticket_no")
+        state.safety_case = True
+        try:
+            await session_svc.set_meta(state.session_id, "safety", True)
+        except Exception as e:  # noqa: BLE001
+            log.warning("agent.safety_persist_failed", error=str(e))
 
         await self._stream_answer(state, extra_instruction=SAFETY_INSTRUCTION)
         if result.ok:
@@ -287,7 +318,17 @@ class Agent:
         """Resolve the product, or pause and ask. Returns True if the turn paused."""
         mentions = state.perception.entities.product_mentions
         has_photo = bool(state.vlm_facts)
+        prior = (await product_svc.get_product(state.session_sku)
+                 if state.session_sku else None)
         if not mentions and not has_photo:
+            # Nothing new named: stay on the product this conversation already settled.
+            # Without this, a follow-up ("is it still under warranty?") reached the tools
+            # with no product at all, and the rewrite's "it → S1 Pro" re-opened the picker.
+            # Unless the message is plainly about another KIND of device ("back to the
+            # earbuds") — then the remembered product is the wrong one to assume.
+            if prior and not state.resolved and not _talks_about_other_category(
+                    state.user_message, prior.get("category")):
+                state.resolved = _resolved_from(prior, "conversation")
             return False
         await self._step_start("identify")
 
@@ -298,7 +339,14 @@ class Agent:
             resolved, candidates, how = await product_svc.disambiguate(
                 mentions, f"{state.user_message} {state.rewritten_query}",
                 customer_id=state.customer_id, vlm_facts=state.vlm_facts,
+                current=state.user_message,
             )
+        # The customer already answered this question earlier in the conversation. If
+        # the product they settled on is one of the candidates, that is the answer —
+        # asking again is the single most "you are not listening" thing an agent can do.
+        if not resolved and prior and any(c.get("sku") == prior["sku"] for c in candidates):
+            resolved, how = next(c for c in candidates if c.get("sku") == prior["sku"]), \
+                "conversation"
 
         # The photo is the fallback, and it has to cover two cases that look different
         # and dead-end identically:
@@ -495,6 +543,19 @@ class Agent:
         if state.vlm_facts:
             lines.append("Photo shows: " + "; ".join(
                 f.get("caption", "") for f in state.vlm_facts if f.get("caption")))
+        if state.purchase:
+            p = state.purchase
+            lines.append(f"Purchase already established from records ({p.get('source')}): "
+                         f"{p.get('order_no') or ''} {p.get('channel') or ''} "
+                         f"{p.get('purchase_date') or ''} "
+                         f"{('dealer ' + p['dealer_name']) if p.get('dealer_name') else ''}".strip())
+        lines.extend(_memory_lines(state))
+        if _escalation_due(state):
+            lines.append(
+                f"ESCALATE NOW: the customer has reported {state.failed_attempts} failed "
+                "fix(es) in this conversation, which is past the limit for how they feel. "
+                "Stop troubleshooting — do not repeat or rephrase steps. Call create_ticket "
+                "so a human takes over, then answer.")
         if state.observations:
             lines.append("\nWhat you have found so far:")
             for o in state.observations[-6:]:
@@ -670,7 +731,14 @@ class Agent:
             if dealer.data.get("found"):
                 args["channel"] = "dealer"
                 args["purchase_date"] = dealer.data.get("purchase_date")
-        result = await tools.run_tool(state, "check_warranty", args)
+        # Announce it like any other call. It used to emit a result with no call, so the
+        # pipeline strip never showed the engine running — yet its card appeared.
+        call_id = f"call_g1_{uuid.uuid4().hex[:6]}"
+        await self.stream.emit(Event.TOOL_CALL, {
+            "call_id": call_id, "tool": "check_warranty",
+            "label": "Checking the warranty rules", "args_preview": "guard G1 repair"})
+        result = await tools.run_tool(state, "check_warranty", args, call_id=call_id)
+        result.data["forced_by_guard"] = True
         state.observations.append(result)
         self._trace(result)
         await self.stream.emit(Event.TOOL_RESULT, {
@@ -813,6 +881,7 @@ class Agent:
                             "in passing so they can correct you)")
         if state.customer_email:
             bits.append(f"Account: {state.customer_email}")
+        bits.extend(_memory_lines(state))
 
         # The photo. The ReAct planner was given this and the COMPOSER was not, so every
         # turn with an attachment was written blind — the customer sent a picture of a
@@ -889,12 +958,83 @@ def _coerce_perception(data: Dict[str, Any], fallback_message: str) -> Perceptio
         language=str(data.get("language") or "en")[:8],
         needs_image=bool(data.get("needs_image")),
         safety_concern=bool(data.get("safety_concern")),
+        fix_failed=bool(data.get("fix_failed")),
+        damage=str(data.get("damage") or "none").lower(),
         summary=str(data.get("summary") or fallback_message[:160]),
     )
 
 
+_ANKER_BRANDS = {"anker", "eufy", "soundcore", "nebula", "anker solix", "solix", "ankermake"}
+
+
+def _memory_lines(state: AgentState) -> List[str]:
+    """What this conversation already settled, for BOTH the planner and the composer.
+
+    Each line is a failure the eval found: a follow-up answered as if the chat had just
+    started. "How long will that take??" one turn after a ticket was opened; "can I keep
+    using it?" one turn after a burning smell; "still not working" answered with the
+    same three steps, or with "which product is it?" about the camera from turn one.
+    """
+    out: List[str] = []
+    if state.safety_case:
+        out.append(
+            "OPEN SAFETY CASE: earlier in this chat the device showed a safety hazard. It "
+            "must not be used, charged or powered on at all until the specialist has dealt "
+            "with it. If they ask whether they can keep using it, the answer is a clear no "
+            "— say why in one line and point to the open ticket.")
+    if state.open_ticket.get("ticket_no"):
+        t = state.open_ticket
+        out.append(f"Open ticket for this chat: {t['ticket_no']} ({t.get('priority')} "
+                   f"priority) — a person picks it up {t.get('eta')}. Do not open another; "
+                   "if they ask about timing, give exactly this.")
+    if state.perception.fix_failed:
+        last = next((m.get("text") or m.get("content") or "" for m in reversed(state.history)
+                     if m.get("role") == "assistant"), "")
+        out.append(
+            f"The customer says the last fix did NOT work (failed attempt "
+            f"{state.failed_attempts}). What you told them last time: «{last[:600]}». Do "
+            "not repeat or rephrase those steps. Give the NEXT thing to check, or hand over "
+            "to a person. Stay on the same device and problem.")
+    for facts in state.vlm_facts or []:
+        brand = ((facts.get("detected") or {}).get("brand") or "").strip().lower()
+        if brand and brand != "unknown" and brand not in _ANKER_BRANDS:
+            out.append(
+                f"The photo shows a {brand}-branded product, not an Anker, eufy or "
+                "soundcore one. Say that first and plainly. Do not treat it as ours, do not "
+                "match it to an Anker model, and do not run or describe an Anker warranty "
+                "for it.")
+    return out
+
+
+def _escalation_due(state: AgentState) -> bool:
+    """The policy table always had a per-emotion limit on failed fixes (angry 1,
+    frustrated 2, calm 3). Nothing read it: failures were counted only from button
+    clicks inside the current turn, so a customer typing "still not working" three
+    times got a fourth round of the same questions. The count is now conversation-wide."""
+    if state.ticket_id or state.perception.safety_concern:
+        return False
+    limit = policy_for(state.perception).escalate_after_failed_steps
+    return state.failed_attempts >= max(1, limit)
+
+
+def _talks_about_other_category(message: str, category: Optional[str]) -> bool:
+    """True when the message carries the vocabulary of a different device category —
+    the same symptom vocabulary the disambiguator already narrows on."""
+    low = (message or "").lower()
+    for cat, words in product_svc.CATEGORY_SIGNALS.items():
+        if cat != category and any(w in low for w in words):
+            return True
+    return False
+
+
+def _resolved_from(row: Dict[str, Any], how: str) -> ResolvedProduct:
+    return ResolvedProduct(sku=row["sku"], name=row["name"], brand=row["brand"],
+                           product_id=row["product_id"], category=row.get("category"), how=how)
+
+
 def _how_phrase(how: str) -> str:
     return {
+        "conversation": "what we settled earlier in this chat",
         "purchase_history": "your order history",
         "symptom_vocabulary": "what you described",
         "photo": "your photo",
@@ -1092,7 +1232,16 @@ def _blocks_from_state(state: AgentState) -> List[Block]:
         ).model_dump()))
 
     w = state.observation_by_tool("check_warranty")
-    if w and w.data.get("decided"):
+    # The G1 repair runs the engine because the DRAFT drifted into coverage language, not
+    # because the customer asked. When that run cannot decide anything (no purchase on
+    # file) and warranty was never the question, the card is noise: a customer asking
+    # why their pump lost suction was shown "Warranty — escalate to a human". The answer
+    # text is still rewritten without the coverage sentence; only the card is withheld.
+    unasked = (w is not None and w.data.get("forced_by_guard")
+               and w.data.get("verdict") in ("escalate_human", "needs_proof")
+               and state.perception.intent not in (Intent.WARRANTY_CLAIM,
+                                                   Intent.RETURN_REFUND))
+    if w and w.data.get("decided") and not unasked:
         d = w.data
         dealer_info = None
         if dealer and (dealer.data.get("dealer") or dealer.data.get("found")):
@@ -1125,8 +1274,11 @@ def _blocks_from_state(state: AgentState) -> List[Block]:
                                 payload=ProductGridPayload(items=items).model_dump()))
 
     policy = policy_for(state.perception)
-    failed = sum(1 for o in state.observations if o.tool == "step_result_failed")
-    if policy.offer_human_early and not state.ticket_id and failed >= 1:
+    failed = max(sum(1 for o in state.observations if o.tool == "step_result_failed"),
+                 state.failed_attempts)
+    created = state.observation_by_tool("create_ticket")
+    if (not state.ticket_id and not (created and created.data.get("created"))
+            and ((policy.offer_human_early and failed >= 1) or _escalation_due(state))):
         blocks.append(human_handoff(HumanHandoffPayload(
             reason="A couple of fixes have not worked and you have a deadline.",
             eta_minutes=8, channels=["chat", "email"],

@@ -164,6 +164,12 @@ async def chat(req: ChatRequest, _: str = Depends(require_api_key)) -> Streaming
         customer_id=session.get("customer_id"),
         history=history,
         turn=len(history) // 2 + 1,
+        session_sku=session.get("resolved_sku"),
+        purchase=((session.get("meta") or {}).get("purchase") or {}),
+        failed_attempts=int((session.get("meta") or {}).get("failed_attempts") or 0),
+        open_ticket=((session.get("meta") or {}).get("ticket") or {}),
+        safety_case=bool((session.get("meta") or {}).get("safety")),
+        ticket_id=(((session.get("meta") or {}).get("ticket") or {}).get("ticket_no")),
     )
 
     stream = SSEStream()
@@ -218,6 +224,12 @@ async def chat_action(req: ChatActionRequest,
         customer_id=session.get("customer_id"),
         history=history,
         turn=int(checkpoint.get("turn", 1)) + 1,
+        session_sku=session.get("resolved_sku"),
+        purchase=((session.get("meta") or {}).get("purchase") or {}),
+        failed_attempts=int((session.get("meta") or {}).get("failed_attempts") or 0),
+        open_ticket=((session.get("meta") or {}).get("ticket") or {}),
+        safety_case=bool((session.get("meta") or {}).get("safety")),
+        ticket_id=(((session.get("meta") or {}).get("ticket") or {}).get("ticket_no")),
     )
     if checkpoint.get("perception"):
         try:

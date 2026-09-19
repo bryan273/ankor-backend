@@ -404,15 +404,31 @@ async def candidates_from_photo(
     return [], "no_match"
 
 
+def _has_model_token(mention: str) -> bool:
+    """A model name carries an identifier — `S1 Pro`, `X10`, `535`, `F3800`. A bare
+    category ("power bank", "earbuds", "my charger") does not, and has no single answer."""
+    return bool(re.search(r"\d", mention or ""))
+
+
 async def disambiguate(
     mentions: List[str], text: str, customer_id: Optional[str] = None,
-    vlm_facts: Optional[List[Dict[str, Any]]] = None,
+    vlm_facts: Optional[List[Dict[str, Any]]] = None, current: str = "",
 ) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]], str]:
     """Resolve a product mention to one product, or report the real ambiguity.
 
     Returns `(resolved_or_none, candidates, how)`. `how` names the discriminator that
     won, which the composer turns into the "going by your March order…" clause.
     """
+    # One picker answers ONE question. Perception reads the rewritten query, which folds
+    # in earlier turns, so "my power bank gets hot" after a chat about earbuds arrived as
+    # two mentions — and their candidates were pooled into one picker titled "Which
+    # soundcore earbuds do you have?" listing power-bank cables. What the customer typed
+    # just now decides which mention is the question.
+    if current and len(mentions or []) > 1:
+        here = normalise_alias(current)
+        now = [m for m in mentions if normalise_alias(m) and normalise_alias(m) in here]
+        mentions = now or mentions
+
     candidates: List[Dict[str, Any]] = []
     seen = set()
     for mention in mentions or []:
@@ -423,13 +439,23 @@ async def disambiguate(
 
     if not candidates:
         return None, [], "no_match"
-    if len(candidates) == 1:
-        return candidates[0], candidates, "alias_unique"
 
     owned = await owned_products(customer_id, [c["product_id"] for c in candidates])
     if len(owned) == 1:
         match = next(c for c in candidates if c["product_id"] == owned[0])
         return match, candidates, "purchase_history"
+
+    # A generic phrase names a category, not a product. The alias table maps "anker
+    # power bank" to exactly one SKU, so it resolved "uniquely" to the 10K Fusion — which
+    # was then remembered, and three turns later "back to the earbuds" was answered with
+    # "the only device linked to you is the Power Bank (10K, Fusion)". Only the
+    # customer's own purchase (above) may pin a SKU from a generic phrase.
+    if not any(_has_model_token(m) for m in mentions or []):
+        log.info("products.generic_mention", mentions=mentions, n=len(candidates))
+        return None, [], "generic"
+
+    if len(candidates) == 1:
+        return candidates[0], candidates, "alias_unique"
 
     # Narrow before deciding. Each discriminator removes candidates it rules out, so a
     # question that survives to the end is a question the customer has genuinely not
@@ -473,6 +499,22 @@ _HAS_SOMETHING_TO_SAY = """
 # over and clean the brush slot", from the deterministic tool the agent trusts above RAG.
 # See scripts/audit_error_codes.py.
 
+# A code is matched on its SHAPE, not its spelling. The seeded rows are written `E-05`,
+# but the robot's screen, the eufy app and every customer write `E05` — and the photo
+# path reads the screen verbatim. An exact compare made the headline S1 demo (an angry
+# customer photographing the app error) answer "I don't have anything on file for E05"
+# while the fix sat in the table under a dash. Normalise both sides the same way:
+# uppercase, drop separators, drop leading zeros after the letter prefix
+# (`e-05` = `E05` = `E5`; `EB01` = `EB1`; `E10` stays `E10`).
+_NORM_SQL = ("regexp_replace(regexp_replace(upper(ec.code), '[^A-Z0-9]', '', 'g'), "
+             "'([A-Z])0+([0-9])', '\\1\\2', 'g')")
+
+
+def normalise_code(code: str) -> str:
+    s = re.sub(r"[^A-Z0-9]", "", (code or "").upper())
+    return re.sub(r"([A-Z])0+(\d)", r"\1\2", s)
+
+
 # One code, one answer. E-05 is stored seven times — once per product it can appear on,
 # and six of those products are spare parts (bumpers, brush guards, a wheel) whose names
 # match the vacuum they fit. Same meaning, same steps, seven rows, so `matches[:3]` was
@@ -483,7 +525,7 @@ _ERROR_CODE_SELECT = f"""
            ec.code, ec.meaning, ec.severity, ec.fix_steps, ec.source_url, p.sku, p.name
     from error_codes ec
     left join products p on p.id = ec.product_id
-    where upper(ec.code) = upper(%s) and {_HAS_SOMETHING_TO_SAY}
+    where {_NORM_SQL} = %s and {_HAS_SOMETHING_TO_SAY}
     {{extra}}
     order by coalesce(ec.meaning, ''), coalesce(ec.fix_steps::text, ''),
              (p.category in ('accessory', 'service')) nulls last,
@@ -491,7 +533,8 @@ _ERROR_CODE_SELECT = f"""
 """
 
 
-async def find_error_code(code: str, product_id: Optional[str] = None) -> List[Dict[str, Any]]:
+async def find_error_code(code: str, product_id: Optional[str] = None,
+                          category: Optional[str] = None) -> List[Dict[str, Any]]:
     """Exact lookup beats RAG for `E-05`, and it cannot hallucinate a meaning.
 
     The join is LEFT, not inner: the import resolved six codes to no product at all, and
@@ -500,8 +543,14 @@ async def find_error_code(code: str, product_id: Optional[str] = None) -> List[D
     if product_id:
         rows = await db.fetch(
             _ERROR_CODE_SELECT.format(extra="and ec.product_id = %s"),
-            (code, product_id),
+            (normalise_code(code), product_id),
         )
         if rows:
             return rows
-    return (await db.fetch(_ERROR_CODE_SELECT.format(extra=""), (code,)))[:5]
+    # Fall back across the catalogue — but never across KINDS of device. A breast pump
+    # with no E01 of its own was handed the robot vacuum's "E01: left wheel jammed".
+    if category:
+        rows = await db.fetch(_ERROR_CODE_SELECT.format(extra="and p.category = %s"),
+                              (normalise_code(code), category))
+        return rows[:5]
+    return (await db.fetch(_ERROR_CODE_SELECT.format(extra=""), (normalise_code(code),)))[:5]

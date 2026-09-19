@@ -55,6 +55,15 @@ async def ensure_session(session_id: Optional[str], customer_email: Optional[str
     return await get_session(new_id)
 
 
+async def set_meta(session_id: str, key: str, value: Any) -> None:
+    """Merge one key into `sessions.meta` — conversation facts that must outlive a turn
+    (the purchase the records established, how many fixes have failed)."""
+    await db.execute(
+        "update sessions set meta = coalesce(meta, '{}'::jsonb) || jsonb_build_object(%s::text, %s::jsonb), "
+        "updated_at = now() where id::text = %s",
+        (key, json.dumps(value, default=str), session_id))
+
+
 async def set_resolved_sku(session_id: str, sku: Optional[str]) -> None:
     await db.execute(
         "update sessions set resolved_sku = %s, updated_at = now() where id::text = %s",

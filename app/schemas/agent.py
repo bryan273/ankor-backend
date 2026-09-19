@@ -62,6 +62,11 @@ class Perception(BaseModel):
     language: str = "en"
     needs_image: bool = False
     safety_concern: bool = False
+    # The customer says a fix we gave them did not work. Counted across the whole
+    # conversation (sessions.meta.failed_attempts) — escalation keys off that count.
+    fix_failed: bool = False
+    # Accidental damage described anywhere in the conversation: none|drop|liquid|crack|wear.
+    damage: str = "none"
     summary: str = ""
 
 
@@ -143,6 +148,25 @@ class AgentState(BaseModel):
     # understanding
     perception: Perception = Field(default_factory=Perception)
     resolved: Optional[ResolvedProduct] = None
+    # The product this SESSION already settled on — by a picker click, purchase history,
+    # a photo — read back at the start of every turn. It used to be written and never
+    # read, so each turn re-identified from scratch: a customer who had just clicked
+    # "robot vacuum" asked "is it under warranty?" and got the same picker again.
+    session_sku: Optional[str] = None
+    # Facts about the purchase this session already established from the RECORDS
+    # (order table, dealer directory, the customer's own orders). The warranty engine
+    # reads these instead of whatever the model types into its arguments.
+    purchase: Dict[str, Any] = Field(default_factory=dict)
+    # How many times, across the whole conversation, the customer has reported that a
+    # fix did not work. Policy escalates on this, not on the current turn alone.
+    failed_attempts: int = 0
+    # The ticket this session already opened, so a follow-up ("how long will that take?")
+    # is answered from it instead of from nothing, and a second ticket is never opened.
+    open_ticket: Dict[str, Any] = Field(default_factory=dict)
+    # Once a conversation has been a safety case it stays one. The follow-up "can I keep
+    # using it until the replacement comes?" carries no alarming words, so it used to be
+    # answered as a fresh question: "that depends on what's wrong with it".
+    safety_case: bool = False
     candidates: List[Dict[str, Any]] = Field(default_factory=list)
 
     # reasoning

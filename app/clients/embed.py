@@ -74,7 +74,9 @@ class Embedder:
                 try:
                     r = await client.post(
                         f"{GOOGLE_BASE}/models/{self.model}:embedContent",
-                        params={"key": self.api_key}, json=payload,
+                        # Header, not ?key=: httpx logs every request URL at INFO, and the query
+                        # form wrote the live key into 825 log lines in one afternoon.
+                        headers={"x-goog-api-key": self.api_key}, json=payload,
                     )
                     if r.status_code == 429 or r.status_code >= 500:
                         await asyncio.sleep(2 ** attempt)
@@ -121,7 +123,9 @@ class Embedder:
                 try:
                     r = await client.post(
                         f"{GOOGLE_BASE}/models/{self.model}:batchEmbedContents",
-                        params={"key": self.api_key}, json=payload,
+                        # Header, not ?key=: httpx logs every request URL at INFO, and the query
+                        # form wrote the live key into 825 log lines in one afternoon.
+                        headers={"x-goog-api-key": self.api_key}, json=payload,
                     )
                     if r.status_code == 429 or r.status_code >= 500:
                         # Exponential, and long. A retry storm against a rate limit is

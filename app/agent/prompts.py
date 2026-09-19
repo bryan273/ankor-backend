@@ -31,6 +31,8 @@ Return ONLY a JSON object:
   "language": "en",
   "needs_image": false,
   "safety_concern": false,
+  "fix_failed": false,
+  "damage": "none|drop|liquid|crack|wear",
   "summary": ""
 }
 
@@ -47,6 +49,8 @@ correct them, and do not invent a brand the user did not say.
 - `safety_concern` is true only for physical danger: swelling, burning, smoke, sparks, \
 melting, electric shock, liquid inside a mains device.
 - `language` is the language to REPLY in — the language the user wrote in.
+- `fix_failed` is true when THIS message reports that something the agent already suggested was tried and did not work ("still not working", "did that, same error", "还是不行", "masih error"). A first report of a problem is false.
+- `damage` is accidental damage the customer has described ANYWHERE in the conversation so far — dropped it, it got wet or fell in water, it cracked — or `wear` for a used-up consumable. `none` if they described no such thing. Never infer damage from a symptom.
 - `summary` is one short sentence of what they need, in English, for internal use.
 
 Report what is there. An unclear message is `unclear`; that is a useful answer, not a \
@@ -157,6 +161,7 @@ difference and will act on it.
 - Do not name a part, colour, button, menu path or location unless it appears in the tool \
 results. No "the orange end cap", no "under Settings > Device", unless it is written there.
 - Never invent a SKU, price, part number, delivery date, contact address or warranty outcome.
+- Never promise an action or a service no tool result shows: no technician visit, no on-site repair, no dispatch, no callback, no courier pickup, no "I'm passing this to a human" unless a ticket was actually created. Offer what exists; say plainly what does not.
 - Warranty coverage is decided by the rule engine, and its verdict is in the tool results. \
 Phrase that verdict. Never soften it, never improve on it, never promise a replacement it \
 did not grant.
@@ -219,7 +224,7 @@ Return ONLY JSON:
   "caption": "one plain sentence describing what is shown",
   "ocr_text": "every word of text visible in the image, verbatim, or empty",
   "detected": {
-    "brand": "anker|eufy|soundcore|unknown",
+    "brand": "anker|eufy|soundcore, or ANY other brand name exactly as printed on the product, or unknown",
     "form_factor": "robot_vacuum|breast_pump|charger|power_bank|power_station|audio|security_camera|projector|unknown",
     "model_number": "the model or SKU if it is actually PRINTED in the photo, else empty",
     "model_number_visible": false,
@@ -238,7 +243,7 @@ Read error codes and screen text exactly as printed — a misread digit sends th
 down the wrong repair. `damage_class` is `physical_damage` for cracks, dents and liquid \
 marks, `wear` for a dirty filter or a frayed cable, `defect` when the device looks intact \
 but reports a fault. Add safety flags for swelling, burn marks, melting, smoke or exposed \
-wiring. Say `unknown` rather than guessing a brand from a shape.
+wiring. Say `unknown` rather than guessing a brand from a shape — but if a logo or brand name IS printed on the product, report it verbatim even when it is not one of ours. A customer holding another company's hub needs to hear that first.
 
 About the model number, which is the thing support most needs and most often cannot get:
 

@@ -20,6 +20,17 @@ import asyncio
 import os
 import sys
 
+# Windows gives a redirected stdout the cp1252 codec, and structlog writes straight to it.
+# A log line carrying Chinese — the brief's own example is 明天要开派对 — raised
+# UnicodeEncodeError INSIDE the log call, i.e. inside the request that was being logged.
+# Logging must never be able to fail a customer's turn.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+import sys
+
 import uvicorn
 
 from app.config import settings
