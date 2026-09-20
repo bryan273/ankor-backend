@@ -136,7 +136,12 @@ SIMPLE_ORDERS = {
 # every category's runner-up. The first screen becomes a vacuum, a power station, a
 # speaker, a camera, which is what a shelf looks like and what tells a customer what
 # is actually sold here. Spare parts and gift cards sort behind all of it.
+# A card with no photograph is a grey box with the brand name printed in it, and four
+# of those on the first screen make the shop look broken. 599 of 1,491 rows have no
+# image, so "photographed first" is a global key, ahead of the category interleave —
+# every category still gets its turn, just with something to look at.
 FEATURED_ORDER = (
+    "(p.hero_image is null), "
     "(case when p.category in ('accessory', 'service') then 1 else 0 end), "
     "p.rank_in_category, p.price desc nulls last, p.name"
 )
@@ -149,7 +154,10 @@ async def search_products(
     limit: int = 12, sort: str = "",
 ) -> List[Dict[str, Any]]:
     """Trigram search over names — the catalog page and the `search_products` tool."""
-    clauses, params = ["1=1"], []
+    # `invalid` is the quarantine flag for rows that are not products: a promo tile
+    # ("Up to $850 off"), a bare variant id. They were still being served to the shop
+    # and to `search_products`, because nothing filtered on status.
+    clauses, params = ["p.status <> 'invalid'"], []
     if query:
         clauses.append("(p.name ilike %s or p.sku ilike %s or similarity(p.name, %s) > 0.2)")
         params += [f"%{query}%", f"%{query}%", query]
@@ -175,7 +183,8 @@ async def search_products(
         # the replacement tank is still there, one screen down.
         sql = (f"select {COLUMNS} from products p where {where} "
                f"order by (case when p.category in ('accessory', 'service') "
-               f"then 1 else 0 end), similarity(p.name, %s) desc, p.name limit %s")
+               f"then 1 else 0 end), similarity(p.name, %s) desc, "
+               f"(p.hero_image is null), p.name limit %s")
         params.append(query)
     else:
         # Ranking has to happen inside the subquery: a window function cannot be used
