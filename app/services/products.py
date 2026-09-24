@@ -149,11 +149,45 @@ RANK_WINDOW = ("row_number() over (partition by p.category "
                "order by (p.hero_image is null), p.price desc nulls last, p.name)")
 
 
+# The same model is listed once per storefront: 1,493 rows collapse to 1,364 models,
+# and 113 of them carry two or three listings that differ only in currency. Nothing
+# collapsed them, so a search for "charger" answered with the Anker 323 Charger (33W)
+# three times over, at 19.99, 27.99 and 39.99 — which reads as three products until you
+# notice those are USD, EUR and AUD. `canonical_id` was written for exactly this and was
+# never read at query time.
+#
+# One listing per model, then: the dollar one where it exists, because the storefront
+# and the cards print dollars, then the one with a photograph, then the cheapest.
+VARIANT_PICK = ("p.canonical_id, (p.currency <> 'USD'), (p.hero_image is null), "
+                "p.price asc nulls last, p.sku")
+
+# Words that match everything and therefore rank nothing.
+STOPWORDS = frozenset((
+    "the", "for", "with", "and", "any", "one", "that", "this", "you", "your", "our",
+    "please", "recommend", "need", "want", "buy", "best", "good", "get", "have",
+))
+
+
+def _terms(query: str) -> Tuple[List[str], List[str]]:
+    """The words worth scoring, and the adjacent pairs of them.
+
+    Whole-string trigram similarity is the wrong instrument for a shopping query: it
+    rewards short names, so "fast charging power bank" ranked a Fast Charging Power
+    Strip above every power bank in the catalogue. Counting which words of the query
+    appear in the name, and paying double when two of them appear *together*, is closer
+    to what the customer meant by putting them in that order.
+    """
+    words = [w for w in re.findall(r"[a-z0-9]+", query.lower())
+             if len(w) > 1 and w not in STOPWORDS]
+    pairs = [f"{a} {b}" for a, b in zip(words, words[1:])]
+    return words, pairs
+
+
 async def search_products(
     query: str = "", brand: Optional[str] = None, category: Optional[str] = None,
     limit: int = 12, sort: str = "",
 ) -> List[Dict[str, Any]]:
-    """Trigram search over names — the catalog page and the `search_products` tool."""
+    """Name search over one listing per model — the catalog page and `search_products`."""
     # `invalid` is the quarantine flag for rows that are not products: a promo tile
     # ("Up to $850 off"), a bare variant id. They were still being served to the shop
     # and to `search_products`, because nothing filtered on status.
@@ -169,29 +203,44 @@ async def search_products(
         params.append(category)
     where = " and ".join(clauses)
 
+    # Collapse the storefront duplicates first, so every ordering below ranks models
+    # rather than listings, and `limit` counts products the customer could tell apart.
+    by_canonical = (f"select distinct on (p.canonical_id) {COLUMNS} "
+                    f"from products p where {where} order by {VARIANT_PICK}")
+    deduped = (f"select distinct on (p.brand, lower(p.name)) * from ({by_canonical}) p "
+               f"order by p.brand, lower(p.name), (p.currency <> 'USD'), "
+               f"(p.hero_image is null), p.price asc nulls last, p.sku")
+
     # An explicit sort always wins. Otherwise a search is ordered by how well the name
     # matches — which is the whole point of typing one — and a bare catalog page falls
     # back to `featured`.
     if sort in SIMPLE_ORDERS:
-        sql = (f"select {COLUMNS} from products p where {where} "
-               f"order by {SIMPLE_ORDERS[sort]} limit %s")
+        sql = f"select * from ({deduped}) p order by {SIMPLE_ORDERS[sort]} limit %s"
     elif query and sort != "featured":
         # Devices before their spare parts. Trigram similarity rewards short names, so
         # a search for "s1 pro" returned "Dust Bin For S1 Pro" and "Swivel Wheel For S1
         # Pro" ahead of the two actual S1 Pro products — the catalog answering a
         # question nobody asked. Somebody searching a model name wants the machine;
         # the replacement tank is still there, one screen down.
-        sql = (f"select {COLUMNS} from products p where {where} "
+        words, pairs = _terms(query)
+        score = " + ".join(["0"] + [f"(p.name ilike %s)::int * 2" for _ in pairs]
+                           + [f"(p.name ilike %s)::int" for _ in words])
+        order_params = ([f"%{t}%" for t in pairs] + [f"%{w}%" for w in words] + [query])
+        # Spare parts behind devices, and multi-item bundles behind the thing itself:
+        # somebody asking for a power bank is answered badly by a power bank taped to a
+        # charging base, however well the words match.
+        sql = (f"select * from ({deduped}) p "
                f"order by (case when p.category in ('accessory', 'service') "
-               f"then 1 else 0 end), similarity(p.name, %s) desc, "
+               f"then 1 else 0 end), "
+               f"(case when p.sku ilike 'BUNDLE-%%' or p.name like '%%+%%' "
+               f"then 1 else 0 end), ({score}) desc, similarity(p.name, %s) desc, "
                f"(p.hero_image is null), p.name limit %s")
-        params.append(query)
+        params += order_params
     else:
         # Ranking has to happen inside the subquery: a window function cannot be used
         # in the ORDER BY of the select that computes it.
-        sql = (f"select {COLUMNS} from ("
-               f"  select *, {RANK_WINDOW} as rank_in_category from products p"
-               f"  where {where}"
+        sql = (f"select * from ("
+               f"  select p.*, {RANK_WINDOW} as rank_in_category from ({deduped}) p"
                f") p order by {FEATURED_ORDER} limit %s")
     params.append(limit)
     return await db.fetch(sql, params)

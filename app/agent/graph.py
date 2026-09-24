@@ -1302,6 +1302,7 @@ def _blocks_from_state(state: AgentState) -> List[Block]:
     if search and state.perception.intent in (Intent.BUY_ADVICE, Intent.PRODUCT_QUESTION):
         items = [ProductCardItem(
             sku=p.get("sku", ""), name=p.get("name", ""), price=p.get("price"),
+            currency=p.get("currency") or "USD",
             image_url=p.get("image_url"), url=p.get("url"),
             badges=["discontinued"] if p.get("status") == "discontinued" else [])
             for p in (search.data.get("products") or [])[:6] if p.get("sku")]

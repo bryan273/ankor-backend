@@ -11,6 +11,7 @@ everywhere:
 """
 from __future__ import annotations
 
+import re
 import time
 import uuid
 from typing import Any, Awaitable, Callable, Dict, List, Optional
@@ -52,18 +53,57 @@ def register(name: str, description: str, args: str, label: str = "",
 
 # ── catalog ───────────────────────────────────────────────────────────────────
 
+# The catalogue's own categories. The planner was free to invent one, or to leave it
+# out, and leaving it out is what put a Fast Charging Power Strip at the top of a search
+# for a fast charging power bank: name matching alone cannot tell a strip from a bank.
+_CATEGORY_SET = frozenset((
+    "audio", "charger", "security_camera", "accessory", "power_station", "power_bank",
+    "robot_vacuum", "service", "breast_pump", "smart_lock", "cable", "tracker",
+    "projector", "mower",
+))
+PRODUCT_CATEGORIES = ", ".join(sorted(_CATEGORY_SET))
+
+
+def _normalise_category(value: Optional[str]) -> Optional[str]:
+    """A category the planner typed, matched against the ones the column actually holds."""
+    if not value:
+        return None
+    token = re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
+    aliases = {"powerbank": "power_bank", "batteries": "power_bank", "battery": "power_bank",
+               "chargers": "charger", "vacuum": "robot_vacuum", "robot_vacuums": "robot_vacuum",
+               "speaker": "audio", "speakers": "audio", "headphones": "audio",
+               "earbuds": "audio", "camera": "security_camera", "cameras": "security_camera",
+               "power_stations": "power_station", "cables": "cable", "trackers": "tracker"}
+    token = aliases.get(token, token)
+    return token if token in _CATEGORY_SET else None
+
+
 @register("search_products",
           "Find products by name or description. Use when the customer names a product "
-          "you have not resolved yet, or asks what to buy.",
+          "you have not resolved yet, or asks what to buy. Pass `category` whenever the "
+          "customer has said what KIND of thing they mean, because a name search alone "
+          "cannot tell a power strip from a power bank. Valid categories: "
+          + PRODUCT_CATEGORIES + ".",
           "query, brand?, category?, k?", label="Looking up the product")
 async def search_products(state: AgentState, query: str = "", brand: Optional[str] = None,
                           category: Optional[str] = None, k: int = 8) -> Dict[str, Any]:
+    # The planner sets these, so they are arguments from a model and get treated as
+    # such. Asked for a fast charging power bank it answered `category="power bank"`,
+    # which is the right word and the wrong token: the column holds `power_bank`, the
+    # filter matched nothing, and the reply came back with no products at all.
+    k = max(1, min(int(k or 8), 12))
+    category = _normalise_category(category)
     rows = await products.search_products(query, brand, category, limit=k)
+    # An invented category returns nothing at all, which is worse than a loose match,
+    # so a categorised search that finds nothing is retried without it.
+    if not rows and category:
+        rows = await products.search_products(query, brand, limit=k)
     if not rows:
         rows = await kb.search_products_vector(query, k=k, category=category)
     return {"found": bool(rows), "count": len(rows),
             "products": [{"sku": r.get("sku"), "name": r.get("name"), "brand": r.get("brand"),
                           "category": r.get("category"), "price": r.get("price"),
+                          "currency": r.get("currency") or "USD",
                           "url": r.get("url"), "image_url": r.get("hero_image"),
                           "status": r.get("status")} for r in rows[:k]]}
 
