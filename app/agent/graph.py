@@ -698,7 +698,7 @@ class Agent:
             if cut > shown:
                 await self.stream.content(_drop_dead_markers(whole[shown:cut], valid))
                 shown = cut
-        return "".join(parts).strip()
+        return plain_punctuation("".join(parts).strip())
 
     async def _stream_answer(self, state: AgentState, extra_instruction: str = "") -> None:
         """Compose and stream in one pass — used by the safety path, which has no guard
@@ -1095,6 +1095,26 @@ def _missing_warranty_call(hits) -> bool:
     return any(h.rule_id == "G1" for h in hits)
 
 
+def plain_punctuation(text: str) -> str:
+    """Take the typographic dashes out of anything the customer reads.
+
+    A dash-joined aside is the single clearest tell that a machine wrote the sentence, and
+    people notice it long before they can say why. The composer is told not to use one;
+    this is the part that does not depend on the model complying.
+
+    Only the em and en dash go. The hyphen stays, because `E-05`, `SOLIX F3800` and
+    `all-in-one` need it, and a support answer that mangles an error code is worse than
+    one that reads like a machine.
+    """
+    out = re.sub("\\s*[\u2014\u2013]\\s*", ", ", text)
+    # The swap leaves doubled punctuation where the dash sat beside a comma, and the
+    # citation stripper can leave a space stranded in front of a full stop.
+    out = re.sub(",\\s*,", ",", out)
+    out = re.sub("[,:;]\\s*([.!?])", "\\1", out)
+    out = re.sub("[ \\t]+([.,!?;:])", "\\1", out)
+    return out
+
+
 def _drop_dead_markers(chunk: str, valid: set) -> str:
     """Remove citation markers that point at nothing, as the text streams.
 
@@ -1104,9 +1124,11 @@ def _drop_dead_markers(chunk: str, valid: set) -> str:
     simply survives — the stored answer is cleaned again afterwards.
     """
     if not valid:
-        return re.sub(r"\s*\[\d{1,2}\]", "", chunk)
-    return re.sub(r"\s*\[(\d{1,2})\]",
-                  lambda m: m.group(0) if int(m.group(1)) in valid else "", chunk)
+        cleaned = re.sub(r"\s*\[\d{1,2}\]", "", chunk)
+    else:
+        cleaned = re.sub(r"\s*\[(\d{1,2})\]",
+                         lambda m: m.group(0) if int(m.group(1)) in valid else "", chunk)
+    return plain_punctuation(cleaned)
 
 
 def _suggestions_cut(text: str) -> int:

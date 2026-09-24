@@ -280,3 +280,29 @@ def test_month_only_date_reads_as_last_day():
     from app.services.warranty import parse_date
     assert parse_date("2024-04") == date(2024, 4, 30)
     assert parse_date("2024-12") == date(2024, 12, 31)
+
+
+# ── no long dashes in anything a customer reads ───────────────────────────────
+
+def test_em_dash_becomes_plain_punctuation():
+    from app.agent.graph import plain_punctuation
+    assert plain_punctuation("Party tomorrow — noted, so let's go") == \
+        "Party tomorrow, noted, so let's go"
+    assert plain_punctuation("Covered – until 2031.") == "Covered, until 2031."
+
+
+def test_hyphens_that_carry_meaning_survive():
+    from app.agent.graph import plain_punctuation
+    kept = "E-05 on an all-in-one SOLIX F3800, order ANK-2026-17883"
+    assert plain_punctuation(kept) == kept
+
+
+def test_stranded_space_before_a_full_stop_is_closed_up():
+    from app.agent.graph import plain_punctuation
+    assert plain_punctuation("the brush roll is blocked .") == "the brush roll is blocked."
+
+
+def test_dash_stripping_survives_the_citation_stripper():
+    from app.agent.graph import _drop_dead_markers
+    out = _drop_dead_markers("blocked [1] — turn it over [9]", {1})
+    assert "—" not in out and "[9]" not in out and "[1]" in out
