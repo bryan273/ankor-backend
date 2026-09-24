@@ -191,10 +191,14 @@ async def messages_with_blocks(session_id: str, limit: int = 50) -> List[Dict[st
     for r in rows:
         r["blocks"] = by_message.get(r["message_id"], [])
         r["attachments"] = by_att.get(r["message_id"], [])
-        reasoning = r.get("reasoning")
-        if isinstance(reasoning, str):
-            reasoning = json.loads(reasoning)
-        r["reasoning"] = reasoning or []
+        trail = r.get("reasoning")
+        if isinstance(trail, str):
+            trail = json.loads(trail)
+        trail = trail or []
+        # Turns written before the trail carried stages have no `kind` at all, and they
+        # are all thoughts — so the absence of the tag means thought, not "unknown".
+        r["reasoning"] = [e for e in trail if e.get("kind", "thought") == "thought"]
+        r["stages"] = [e for e in trail if e.get("kind") == "stage"]
         r["tools"] = by_tool.get(r["message_id"], [])
         r["guard_hits"] = by_guard.get(r["message_id"], [])
     return rows

@@ -464,11 +464,15 @@ class Agent:
             if thought:
                 # Tagged with the iteration so the UI can show the loop turning rather
                 # than one long undifferentiated "thinking" blur.
-                await self.stream.emit(Event.THINKING_DELTA, {
-                    "stage_id": "investigate", "delta": thought,
-                    "iteration": state.iterations,
-                    "decision": action if action not in ("answer", "", "none") else "answer",
-                })
+                # Through `thinking`, not `emit`: the recorder lives there, and this is
+                # the trail that matters most. Emitting it directly meant the loop's own
+                # reasoning — the part an operator needs to explain an answer — streamed
+                # past the live viewer and was never written down.
+                await self.stream.thinking(
+                    "investigate", thought,
+                    iteration=state.iterations,
+                    decision=action if action not in ("answer", "", "none") else "answer",
+                )
                 state.scratchpad.append(thought)
 
             if action in ("answer", "", "none", "final"):

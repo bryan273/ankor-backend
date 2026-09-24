@@ -87,11 +87,13 @@ async def unhandled_handler(request: Request, exc: Exception) -> JSONResponse:
     )
 
 
-from app.routes import catalog, chat, health, tickets, attachments, evaluation  # noqa: E402
+from app.routes import (catalog, chat, customers, health, tickets, attachments,  # noqa: E402
+                        evaluation)
 
 app.include_router(health.router)
 app.include_router(chat.router, prefix="/api/v1")
 app.include_router(catalog.router, prefix="/api/v1")
+app.include_router(customers.router, prefix="/api/v1")
 app.include_router(tickets.router, prefix="/api/v1")
 app.include_router(attachments.router, prefix="/api/v1")
 app.include_router(evaluation.router, prefix="/api/v1")

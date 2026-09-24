@@ -65,7 +65,11 @@ class SSEStream:
         self._terminated = False
         self._heartbeat = heartbeat
         self.emitted: List[str] = []  # for tests and the trace drawer
-        self.reasoning: List[Dict[str, str]] = []  # persisted with the turn
+        self.reasoning: List[Dict[str, Any]] = []  # persisted with the turn
+        # The pipeline, recorded as it runs. An operator opening the conversation later
+        # needs to see which steps ran, how long each took and what it decided — the
+        # stage events were streamed to whoever was watching live and then lost.
+        self.stages: List[Dict[str, Any]] = []
 
     # ── emit ──────────────────────────────────────────────────────────────────
     async def emit(self, event: Event, data: Optional[Dict[str, Any]] = None) -> None:
@@ -95,6 +99,10 @@ class SSEStream:
         through once.
         """
         self._open_stages[stage_id] = time.perf_counter()
+        self.stages.append({"stage_id": stage_id, "label": label,
+                            "description": description, "ord": ord,
+                            "node": node or stage_id, "iteration": iteration,
+                            "state": "running", "ms": 0, "detail": {}})
         await self.emit(Event.STAGE_START, {
             "stage_id": stage_id, "label": label, "description": description,
             "ord": ord, "node": node or stage_id, "iteration": iteration,
@@ -110,11 +118,25 @@ class SSEStream:
         """
         started = self._open_stages.pop(stage_id, None)
         ms = int((time.perf_counter() - started) * 1000) if started else 0
+        self._close_record(stage_id, ms, "done", detail or {})
         await self.emit(Event.STAGE_COMPLETE,
                         {"stage_id": stage_id, "ms": ms, "detail": detail or {}})
 
+    def _close_record(self, stage_id: str, ms: int, state: str,
+                      detail: Optional[Dict[str, Any]] = None) -> None:
+        """Finish the LAST open record for this step, not the first.
+
+        `investigate` opens once per ReAct pass, so matching on the id alone would keep
+        closing the first pass and leave the later ones running forever in the replay.
+        """
+        for entry in reversed(self.stages):
+            if entry["stage_id"] == stage_id and entry["state"] == "running":
+                entry.update(ms=ms, state=state, detail=detail or entry.get("detail") or {})
+                return
+
     async def stage_error(self, stage_id: str, code: str, message: str) -> None:
         self._open_stages.pop(stage_id, None)
+        self._close_record(stage_id, 0, "error", {"code": code, "message": message})
         await self.emit(Event.STAGE_ERROR, {"stage_id": stage_id, "code": code,
                                             "message": message})
 
@@ -124,16 +146,18 @@ class SSEStream:
         for stage_id in list(self._open_stages):
             started = self._open_stages.pop(stage_id)
             ms = int((time.perf_counter() - started) * 1000)
+            self._close_record(stage_id, ms, "done")
             self.emitted.append(Event.STAGE_COMPLETE.value)
             await self._queue.put((Event.STAGE_COMPLETE.value, {"stage_id": stage_id, "ms": ms}))
 
-    async def thinking(self, stage_id: str, delta: str) -> None:
+    async def thinking(self, stage_id: str, delta: str, **extra: Any) -> None:
         # Recorded as well as streamed. The reasoning trail used to exist only as it
         # flew past: a support agent opening the conversation an hour later — exactly
         # the person who has to explain why the system said what it said — got an empty
         # panel, because nothing had ever written it down.
-        self.reasoning.append({"stage_id": stage_id, "text": delta})
-        await self.emit(Event.THINKING_DELTA, {"stage_id": stage_id, "delta": delta})
+        self.reasoning.append({"stage_id": stage_id, "text": delta, **extra})
+        await self.emit(Event.THINKING_DELTA,
+                        {"stage_id": stage_id, "delta": delta, **extra})
 
     async def content(self, delta: str) -> None:
         await self.emit(Event.CONTENT_DELTA, {"delta": delta})

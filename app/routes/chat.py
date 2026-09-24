@@ -117,7 +117,15 @@ async def _persist(state: AgentState, agent: Agent, failed: bool = False,
             intensity=state.perception.intensity,
             intent=state.perception.intent.value,
             urgency=state.perception.urgency.model_dump(),
-            reasoning=(stream.reasoning if stream else None),
+            # Thoughts and the pipeline ride in the same column, tagged. `messages`
+            # has one jsonb field for the trail, and adding a second column to a
+            # shared database for this is a migration nobody needs: the reader splits
+            # them again by `kind`.
+            reasoning=(
+                [{"kind": "thought", **r} for r in stream.reasoning]
+                + [{"kind": "stage", **st} for st in stream.stages]
+                if stream else None
+            ),
         )
         for block in state.blocks:
             await session_svc.save_block(message_id, block.model_dump())
