@@ -6,8 +6,8 @@
       "excludeFiles": "{data/**,logs/**,scripts/**,tests/**,docs/**,db/**,.venv/**,**/__pycache__/**}"
     }
   },
-  "rewrites": [
-    { "source": "/(.*)", "destination": "/app/main" }
+  "routes": [
+    { "src": "/(.*)", "dest": "app/main.py" }
   ],
   "regions": ["hnd1"]
 }

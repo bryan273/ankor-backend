@@ -102,3 +102,45 @@ def test_photo_does_not_resolve_when_two_candidates_share_the_form_factor():
 @pytest.mark.parametrize("raw", ["S1 Pro", "s1-pro", "S1  PRO", "s1_pro"])
 def test_alias_normalisation_collapses_punctuation_and_case(raw):
     assert normalise_alias(raw) == "s1 pro"
+
+
+# ── picker hints ──────────────────────────────────────────────────────────────
+# Found by scripts/e2e_journeys.py (P3). Asking about a "SOLIX power station"
+# produced four options — a $28 ball cap, two wall adapters and a power dock —
+# each labelled "The large portable power station", because the hint was keyed on
+# category alone and every one of them is filed under `power_station`. The customer
+# was asked to choose between four identical descriptions, one of which is a hat.
+from app.agent.graph import _option_hints
+
+
+def test_hint_uses_category_when_categories_differ():
+    hints = _option_hints([
+        {"category": "robot_vacuum", "brand": "eufy", "price": 899.0},
+        {"category": "breast_pump", "brand": "eufy", "price": 199.0},
+    ])
+    assert hints == ["The robot vacuum that docks in a station", "The wearable pump"]
+
+
+def test_hint_falls_back_to_price_when_every_option_shares_a_category():
+    hints = _option_hints([
+        {"category": "power_station", "brand": "Anker SOLIX", "price": 28.0},
+        {"category": "power_station", "brand": "Anker SOLIX", "price": 1999.0},
+    ])
+    assert hints == ["$28.00", "$1,999.00"]
+    assert "The large portable power station" not in hints
+
+
+def test_hint_is_blank_rather_than_wrong_when_nothing_separates_them():
+    hints = _option_hints([
+        {"category": "power_station", "brand": "Anker SOLIX", "price": None},
+        {"category": "power_station", "brand": "Anker SOLIX", "price": None},
+    ])
+    assert hints == ["", ""]
+
+
+def test_hint_never_repeats_one_description_across_every_option():
+    """The actual defect: four options, one identical hint, one of them a ball cap."""
+    same_category = [{"category": "power_station", "brand": "Anker SOLIX", "price": p}
+                     for p in (28.0, 39.99, 59.99, 1999.0)]
+    hints = _option_hints(same_category)
+    assert len(set(hints)) == len(hints)

@@ -413,10 +413,13 @@ class Agent:
                 "" if how.startswith("photo") else (mentions[0] if mentions else ""),
                 candidates,
                 where_to_look=_where_to_look(state.vlm_facts))
+            shortlist = candidates[:4]
+            hints = _option_hints(shortlist)
             options = [ProductOption(
                 sku=c["sku"], name=c["name"], brand=c["brand"],
                 image_url=c.get("hero_image"), price=c.get("price"),
-                category=c.get("category"), hint=_option_hint(c)) for c in candidates[:4]]
+                category=c.get("category"), hint=hint)
+                for c, hint in zip(shortlist, hints)]
             block = product_picker(question, options)
             state.blocks.append(block)
             state.awaiting_action = True
@@ -1107,17 +1110,40 @@ def _where_to_look(vlm_facts) -> str:
     return ""
 
 
-def _option_hint(c: Dict[str, Any]) -> str:
-    return {
-        "robot_vacuum": "The robot vacuum that docks in a station",
-        "breast_pump": "The wearable pump",
-        "charger": "The wall charger",
-        "power_bank": "The portable battery",
-        "power_station": "The large portable power station",
-        "audio": "The earbuds/headphones",
-        "security_camera": "The security camera",
-        "projector": "The projector",
-    }.get(c.get("category") or "", c.get("brand", ""))
+_CATEGORY_HINT = {
+    "robot_vacuum": "The robot vacuum that docks in a station",
+    "breast_pump": "The wearable pump",
+    "charger": "The wall charger",
+    "power_bank": "The portable battery",
+    "power_station": "The large portable power station",
+    "audio": "The earbuds/headphones",
+    "security_camera": "The security camera",
+    "projector": "The projector",
+}
+
+
+def _option_hints(candidates: List[Dict[str, Any]]) -> List[str]:
+    """One hint per option, and only where the hint actually tells them apart.
+
+    A hint keyed on category alone is worse than no hint when every option shares that
+    category: asking about a "SOLIX power station" produced four options — a $28 ball
+    cap, two wall adapters and a power dock — each labelled "The large portable power
+    station", because each is filed under `power_station`. The customer is asked to
+    choose between four identical descriptions, one of which is a hat.
+
+    So the category hint is used only when the candidates disagree about category. When
+    they agree, price is the next thing that separates them; failing that, nothing is
+    said, because a blank hint costs nothing and a wrong one costs trust.
+    """
+    cats = {(c.get("category") or "") for c in candidates}
+    if len(cats) > 1:
+        return [_CATEGORY_HINT.get(c.get("category") or "", c.get("brand", "") or "")
+                for c in candidates]
+    prices = [c.get("price") for c in candidates]
+    if len({p for p in prices if p is not None}) == len([p for p in prices if p is not None]) \
+            and all(p is not None for p in prices):
+        return [f"${p:,.2f}" for p in prices]
+    return ["" for _ in candidates]
 
 
 def _preview(args: Dict[str, Any]) -> str:
