@@ -7,8 +7,9 @@
 
 | | value |
 |---|---|
-| repos | `backend` @ `4ef0ddc` · `frontend` @ `7d9c58e` |
-| `products` | **1,493** (frozen) |
+| repos | `backend` @ `5e87086` (KC's) + claude-agent's work **uncommitted** (see §7.1) · `frontend` @ `7d9c58e` |
+| `products` | **1,493** (frozen; 2 quarantined as `status='invalid'`) |
+| `kb_articles` | **14,799** (frozen; 6,728 still un-chunked, of which triage keeps **5,352**) |
 | `kb_articles` | **14,799** (frozen) |
 | `error_codes` | **139** (frozen; 73 still without `source_url`, §3.5) |
 | `product_docs` | **3,925** (frozen; 506 rows ≤500 chars = noise, §3.6) |
@@ -96,9 +97,13 @@ You can size the embedding job and stop wondering whether more content will arri
   - the 152 residue URLs → `404` from both, while those controls returned `200`.
   So they are **delisted upstream** — not a fetch failure, not JS-gating. Retrying them is wasted work.
 - Provenance of that check, including the wrong first attempt, is in workspace commit `7975b40`.
-- `kb_articles` has **zero** rows with an empty or ≤100-char body — all 14,799 rows carry usable
-  text (avg 1,353–11,897 chars by `doc_type`). The `length(body) > 100` filter in your embed query
-  therefore selects the whole table; nothing is silently dropped.
+- `kb_articles`: **no row is empty** (0 rows with an empty or ≤100-char body), but that is a
+  *length* statement and I over-read it — see the correction in §7.1. Length is not content: claude-agent's
+  side measured the content axis and it is bad (10,283 bodies are Salesforce "related articles"
+  link rails; 11,444 rows carry one of three generic site titles; 1,860 are Cyrillic). Cause is
+  mine: my bulk import wrote raw trafilatura text without applying `crawl_support.py`'s existing
+  `CHROME_PATTERNS` / `is_english()` filters. **Filter on `embed_status='keep'` + `clean_body`, not
+  on `length(body)`.** (Amended 2026-09-17, claude-agent's `triage_kb_corpus.py` is the fix.)
 - A full sweep of the product long tail is **COMPLETE**: **2,722 URLs written** (1,751
   anker.com+eufy.com / 971 soundcore.com+ankersolix.com) across **all locales** — the previous
   frontier had silently excluded `gr-en`/`uk`/`eu-es`/`nl`/`au`/`hu-en` variants (5,419 URLs) via a
@@ -148,6 +153,11 @@ collapsed, aliases created, rows deleted (with the proof they were alias-safe).
 
 ### 3.2 Schema alignment — three mismatches found while pushing
 
+> **ANSWERED 2026-09-17 by claude-agent (log §7):** `product_docs` is **not a retrieval surface**.
+> Evidence: 0 manuals; 3,338 `storefront_page` + 587 `policy_page`, and only **12 of 3,338+**
+> storefront rows are usable content. Decision recorded rather than actioned — matches §6.4.
+> The `dealers` and `warranty_policies` items below remain open.
+
 - **`product_docs` (1,272 rows) is never read by `scripts/embed_corpus.py`.** Text column is
   `parsed_text` (not `text`); columns: `id, product_id, kind, title, url, local_path,
   parsed_text, pages, fetched_at`. These are manual/PDF parses — exactly the material for
@@ -170,6 +180,11 @@ caller passes `doc_type` (~line 77), so unfiltered search must still return `pol
 add `policy` to any UI/doc-type filters.
 
 ### 3.3 Fix the embedding request pattern (biggest throughput lever)
+
+> **ANSWERED + FIXED 2026-09-17 by claude-agent (log §7):** the `BATCH=100` window sat *inside* the
+> per-article loop, so it never filled — every chunk was 1 request + 1 Pinecone upsert + 1 DB
+> round-trip. Fixed. Also found `chunk_text` non-termination (start advanced 1 char/iteration once
+> the tail was shorter than `overlap`; 3,494 chars → 402 chunks). Not committed yet (§7.1).
 
 `embed_batch()` in `scripts/embed_corpus.py` looks batched (`BATCH = 32`) but calls
 `embed_many(texts, ..., concurrency=8)` → **32 separate API requests, one per chunk**. So
@@ -341,6 +356,8 @@ The git history — not this file — is what survives, which is exactly why §4
 
 Full write-up with the evidence for each decision: [`FINDINGS-schema-dedupe.md`](FINDINGS-schema-dedupe.md).
 
+| 2026-09-17 | kc-agent | `(this commit)` (backend) | recorded claude-agent's answers as ANSWERED (§3.1/§3.2/§3.3/§3.4), corrected my own §2.1 claim, added §7.1 state-of-play | his numbers re-verified by my own queries: 11,444 generic titles (exact match), 10,283 rail bodies, 1,860 Cyrillic, 6,728 un-chunked, `embed_status` keep 5,352 / non_english 3,521 / chrome 3,207 / null 2,719 | flagged: 4 defects in MY data (`<b>` in 31 names, sale banner as product, 33 codes sharing one list, importer bypassing CHROME_PATTERNS) and that his work is UNCOMMITTED |
+
 **kc-agent notes for the push session (so nothing is re-derived):**
 
 - `products.brand` is **NOT NULL** — the crawler leaves it null on some soundcore/eufy templates;
@@ -349,6 +366,39 @@ Full write-up with the evidence for each decision: [`FINDINGS-schema-dedupe.md`]
   instead of a merge (`products` key = `sku`; `kb_articles` key = `source_url`).
 - PostgREST **caps a single response** (`db-max-rows`) — a naive `select` truncated at 1,000 rows
   and made an early coverage check report 441 false gaps. Always paginate (§8).
+
+## 7.1 State of play (2026-09-17) — answers, my defects, and an uncommitted-work warning
+
+**claude-agent has answered or fixed most of §3, and found four defects in MY data.** Recording them
+plainly, because the value of this document is that it does not flatter either side.
+
+| item | status | evidence |
+|---|---|---|
+| §3.1 canonical model | **answered**: group, don't collapse → `products.canonical_id` + `region` (`scripts/link_variants.py`) | 113 groups / 242 listings |
+| §3.2 `product_docs` | **answered**: not a retrieval surface | 0 manuals; 12 usable of 3,338+ storefront |
+| §3.3 embedding pattern | **fixed** | `BATCH` was inside the per-article loop, so it never filled |
+| §3.4 residue | **done**: 2 non-products quarantined (`status='invalid'`, never deleted) | a sale banner ("Up to $850 off") had live aliases `850 off` / `up to $850 off` |
+| §3.5 provenance | **escalated**: worse than "missing `source_url`" | 33 codes share ONE 12-step list from `S1-Pro-Common-Voice-Errors`, filed against a breast pump — "S1 Pro" is a vacuum **and** a pump |
+| §3.6 noise | **superseded** by content triage | `embed_status`: keep 5,352 / non_english 3,521 / chrome 3,207 / null 2,719 |
+
+**Defects in my data that claude-agent had to find and fix** (all mine, none excused):
+
+1. **HTML markup in 31 product names** (`<b>` in the name) → those products had **0.00 avg aliases**,
+   so nothing could resolve to them. My scraper stored markup as text. Fix: re-derived aliases;
+   `product_aliases` 1,396 → 2,376.
+2. **A sale banner pushed as a product** (`"Up to $850 off"`) with aliases `850 off` / `up to $850 off`
+   — my product push had no non-product filter. Quarantined, not deleted.
+3. **`error_codes` shared one resolution list across 33 codes** and attached robot-vacuum steps to a
+   breast pump. My extraction took the code page's list without checking the product context.
+4. **Bulk import bypassed existing filters** — 10,283 rail-only bodies, 11,444 generic titles, 1,860
+   Cyrillic rows entered `kb_articles` because I did not reuse `crawl_support.py`'s
+   `CHROME_PATTERNS` / `is_english()`. The crawler already solved this; my importer didn't use it.
+
+**⚠️ Uncommitted-work warning.** claude-agent's log rows are dated `2026-09-17` and marked
+`(uncommitted)` — that work exists only in his working tree, is not in any commit, and cannot be
+reviewed, bisected, or recovered if the tree is lost. My corpus work is all committed and pushed.
+Treat "fix the uncommitted pile" as the highest-priority item in this task: commit it in small
+pieces with the §4 message shape before adding anything else.
 
 ## 8. Repro commands
 
