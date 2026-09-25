@@ -462,14 +462,19 @@ class Agent:
             data, usage = await self.llm.json_complete(
                 [{"role": "user", "content": prompt}], max_tokens=900, default={})
             if data.get("question"):
-                return data["question"]
+                # The picker line is written by its own prompt, so the composer's "no
+                # long dash" rule never reached it, and this is the line that produced
+                # them most: "Which Anker powerbank do you have—the 20,000mAh or the
+                # 5,000mAh?". Every string the customer reads goes through the same
+                # cleaner, not just the ones the composer wrote.
+                return plain_punctuation(data["question"])
         except Exception as e:  # noqa: BLE001
             log.warning("agent.picker_question_failed", error=str(e)[:120])
         if not mention:
-            return ("I can see the type of device, but not which model — the model number "
+            return ("I can see the type of device, but not which model. The model number "
                     f"is usually {where_to_look or 'on a sticker on the device'}. "
                     "Is it one of these?")
-        return (f"Quick check — \"{mention}\" is used for more than one of our products. "
+        return (f"Quick check: \"{mention}\" is used for more than one of our products. "
                 "Which of these is yours?")
 
     async def _react(self, state: AgentState) -> None:
@@ -719,7 +724,13 @@ class Agent:
             whole = "".join(parts)
             cut = _suggestions_cut(whole)
             if cut > shown:
-                await self.stream.content(_drop_dead_markers(whole[shown:cut], valid))
+                # `plain_punctuation` was applied to the returned draft and not to the
+                # live stream, so the stored answer was clean and the customer watching
+                # it arrive still saw the dash: "Which Anker powerbank do you have—the
+                # 20,000mAh one or the 5,000mAh one?". The text on screen is the text
+                # they read, so the cleaning belongs here too.
+                await self.stream.content(
+                    plain_punctuation(_drop_dead_markers(whole[shown:cut], valid)))
                 shown = cut
         return plain_punctuation("".join(parts).strip())
 
