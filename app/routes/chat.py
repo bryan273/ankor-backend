@@ -150,14 +150,28 @@ async def chat(req: ChatRequest, _: str = Depends(require_api_key)) -> Streaming
             req.session_id, req.client_context.customer_email, req.locale)
         session_id = session["session_id"]
 
-        user_message_id = await session_svc.add_message(session_id, "user", req.message)
-        # Bind the photos to the message they arrived with. They were uploaded before
-        # this message existed, so until now they belonged to nothing and the support
-        # console had no way to show the agent what the customer actually sent.
-        await session_svc.link_attachments(user_message_id, req.attachment_ids, session_id)
+        # Read the history BEFORE writing this turn's message, so it contains what came
+        # before without having to slice the last row off and hope the ordering held.
         history = await session_svc.history(session_id, limit=12)
-        # `history` includes the message just written; the agent wants what came before it.
-        history = history[:-1] if history else []
+
+        # Writing the customer's message, and binding the photos that arrived with it,
+        # is not something the customer is waiting for: nothing downstream in THIS turn
+        # reads it back. The database is remote and every round trip costs about 250ms,
+        # so these two move off the critical path and the stream starts a quarter of a
+        # second sooner. Failures are logged rather than raised: a message that did not
+        # persist is a gap in the console's transcript, not a reason to refuse the turn.
+        async def _record_the_message() -> None:
+            try:
+                message_id = await session_svc.add_message(session_id, "user", req.message)
+                # The photos were uploaded before this message existed, so until now they
+                # belonged to nothing and the console had no way to show the agent what
+                # the customer actually sent.
+                await session_svc.link_attachments(
+                    message_id, req.attachment_ids, session_id)
+            except Exception as e:  # noqa: BLE001
+                log.warning("chat.user_message_persist_failed", error=str(e)[:200])
+
+        asyncio.create_task(_record_the_message())
     except Exception:
         slot.release()
         raise
@@ -177,6 +191,8 @@ async def chat(req: ChatRequest, _: str = Depends(require_api_key)) -> Streaming
         failed_attempts=int((session.get("meta") or {}).get("failed_attempts") or 0),
         open_ticket=((session.get("meta") or {}).get("ticket") or {}),
         safety_case=bool((session.get("meta") or {}).get("safety")),
+        shown_skus=list((session.get("meta") or {}).get("shown") or []),
+        active_flow=((session.get("meta") or {}).get("flow") or {}),
         ticket_id=(((session.get("meta") or {}).get("ticket") or {}).get("ticket_no")),
     )
 
@@ -237,6 +253,8 @@ async def chat_action(req: ChatActionRequest,
         failed_attempts=int((session.get("meta") or {}).get("failed_attempts") or 0),
         open_ticket=((session.get("meta") or {}).get("ticket") or {}),
         safety_case=bool((session.get("meta") or {}).get("safety")),
+        shown_skus=list((session.get("meta") or {}).get("shown") or []),
+        active_flow=((session.get("meta") or {}).get("flow") or {}),
         ticket_id=(((session.get("meta") or {}).get("ticket") or {}).get("ticket_no")),
     )
     if checkpoint.get("perception"):

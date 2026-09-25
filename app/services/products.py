@@ -119,8 +119,8 @@ COLUMNS = ("p.id::text as product_id, p.sku, p.name, p.brand, p.category, p.pric
            "p.currency, p.url, p.hero_image, p.status, p.warranty_months")
 
 SIMPLE_ORDERS = {
-    "price_asc": "p.price asc nulls last, p.name",
-    "price_desc": "p.price desc nulls last, p.name",
+    "price_asc": "(p.currency <> 'USD'), p.price asc nulls last, p.name",
+    "price_desc": "(p.currency <> 'USD'), p.price desc nulls last, p.name",
     "name": "p.name",
 }
 
@@ -141,7 +141,7 @@ SIMPLE_ORDERS = {
 # image, so "photographed first" is a global key, ahead of the category interleave —
 # every category still gets its turn, just with something to look at.
 FEATURED_ORDER = (
-    "(p.hero_image is null), "
+    "(p.hero_image is null), (p.price is null), "
     "(case when p.category in ('accessory', 'service') then 1 else 0 end), "
     "p.rank_in_category, p.price desc nulls last, p.name"
 )
@@ -164,8 +164,72 @@ VARIANT_PICK = ("p.canonical_id, (p.currency <> 'USD'), (p.hero_image is null), 
 # Words that match everything and therefore rank nothing.
 STOPWORDS = frozenset((
     "the", "for", "with", "and", "any", "one", "that", "this", "you", "your", "our",
-    "please", "recommend", "need", "want", "buy", "best", "good", "get", "have",
+    "please", "recommend", "need", "want", "buy", "sell", "best", "good", "get",
+    "have", "looking", "something", "anything", "there", "about", "does", "did",
 ))
+
+
+# How rare a word has to be before it counts as the point of the query. Tuned against
+# the catalogue: "charging" is in 300-odd names and says almost nothing, "iphone" is in
+# none and says everything.
+DISTINCTIVE_DF = 120
+_DF: Dict[str, int] = {}
+_ROWS: Optional[int] = None
+
+
+WORD = r"\y{}\y"  # Postgres word boundary: "trip" must not match "Power Strip".
+
+
+def _forms(word: str) -> List[str]:
+    """A word and the form the catalogue is likely to spell it in.
+
+    Shoppers type plurals and product names do not: 29 names contain "robot", three
+    contain "vacuums", and all three of those are mop cloths compatible with robot
+    vacuums. Matching only what was typed answered "im looking at robot vacuums" with
+    replacement pads.
+    """
+    forms = [word]
+    if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
+        forms.append(word[:-1])
+        if word.endswith("es") and len(word) > 4:
+            forms.append(word[:-2])
+    return forms
+
+
+def _pattern(word: str) -> str:
+    return r"\y(" + "|".join(_forms(word)) + r")\y"
+
+
+async def _doc_freq(word: str) -> int:
+    """How many product names contain this word. Cached: the catalogue does not move."""
+    if word not in _DF:
+        rows = await db.fetch(
+            "select count(*) c from products where status <> 'invalid' and name ~* %s",
+            [_pattern(word)])
+        _DF[word] = int(rows[0]["c"]) if rows else 0
+    return _DF[word]
+
+
+async def _really_absent(word: str) -> bool:
+    """A word no name contains — is that a typo, or a thing this shop does not sell?
+
+    Measured against this catalogue: misspellings score 0.57 and up ("vacuuum" 0.88,
+    "chargr" 0.71, "powerbnk" 0.67, "earbds" 0.57) while things nobody here sells score
+    0.43 and below ("fridge" 0.43, "dyson" 0.33, "samsung" 0.25). One exception breaks
+    the rule and it is the most likely typo of all: "anekr" scores 0.33, because trigram
+    similarity is blind to transposed letters. Brands are four known names, so that one
+    is worth checking directly rather than guessing at a lower threshold that would let
+    "dyson" through.
+    """
+    rows = await db.fetch(
+        "select max(word_similarity(%s, name)) m from products where status <> 'invalid'",
+        [_forms(word)[-1]])
+    if float((rows[0]["m"] if rows else None) or 0) >= 0.50:
+        return False
+    brands = await db.fetch(
+        "select 1 from products where status <> 'invalid' "
+        "and word_similarity(%s, brand) >= 0.3 limit 1", [word])
+    return not brands
 
 
 def _terms(query: str) -> Tuple[List[str], List[str]]:
@@ -178,7 +242,8 @@ def _terms(query: str) -> Tuple[List[str], List[str]]:
     to what the customer meant by putting them in that order.
     """
     words = [w for w in re.findall(r"[a-z0-9]+", query.lower())
-             if len(w) > 1 and w not in STOPWORDS]
+             if w not in STOPWORDS
+             and (len(w) > 2 or (len(w) > 1 and any(ch.isdigit() for ch in w)))]
     pairs = [f"{a} {b}" for a, b in zip(words, words[1:])]
     return words, pairs
 
@@ -187,14 +252,50 @@ async def search_products(
     query: str = "", brand: Optional[str] = None, category: Optional[str] = None,
     limit: int = 12, sort: str = "",
 ) -> List[Dict[str, Any]]:
-    """Name search over one listing per model — the catalog page and `search_products`."""
+    """Name search over one listing per model — the catalog page and `search_products`.
+
+    The matching is deliberately word-led rather than phrase-led. A shopper types a
+    sentence, not a product name: "fast charging power bank" appears verbatim in nothing,
+    so a whole-string match finds nothing and whole-string trigram similarity finds
+    whatever is shortest. What decides the result here is the RAREST word in the query,
+    because that is the one carrying the request — "bank" in that sentence, "iphone" in
+    "iphone case", "s1" in "s1 pro" — while "fast" and "charging" say almost nothing.
+    """
     # `invalid` is the quarantine flag for rows that are not products: a promo tile
-    # ("Up to $850 off"), a bare variant id. They were still being served to the shop
-    # and to `search_products`, because nothing filtered on status.
+    # ("Up to $850 off"), a bare variant id.
     clauses, params = ["p.status <> 'invalid'"], []
+
+    words: List[str] = []
+    pairs: List[str] = []
+    weights: Dict[str, int] = {}
+    rarest = ""
     if query:
-        clauses.append("(p.name ilike %s or p.sku ilike %s or similarity(p.name, %s) > 0.2)")
-        params += [f"%{query}%", f"%{query}%", query]
+        words, pairs = _terms(query)
+        weights = {w: await _doc_freq(w) for w in words}
+        absent = [w for w, df in weights.items() if df == 0 and await _really_absent(w)]
+        # An absent word only ends the search when it IS the request. "do you sell
+        # iphones" asks for something this shop does not stock, and six near-misses
+        # presented as an answer is worse than an empty shelf. But "robot vacuum, i have
+        # a dog and wooden floors" also contains words no product name carries, and
+        # answering that with nothing is worse still — the dog is a constraint, not the
+        # thing being bought.
+        if absent and (words[-1] in absent or len(absent) == len(words)):
+            log.info("products.absent_term", query=query[:60], word=absent[0])
+            return []
+        for w in [w for w, df in weights.items() if df == 0]:
+            weights.pop(w, None)
+        words = [w for w in words if w in weights]
+        heads = [w for w in reversed(words) if weights[w] <= DISTINCTIVE_DF]
+        head = heads[0] if heads else ""
+        if head:
+            clauses.append("p.name ~* %s")
+            params.append(_pattern(head))
+        else:
+            # Nothing in the query is rare enough to narrow on ("charger", "cable").
+            # Fall back to the phrase, which is what a one-word query is anyway.
+            clauses.append(
+                "(p.name ilike %s or p.sku ilike %s or similarity(p.name, %s) > 0.2)")
+            params += [f"%{query}%", f"%{query}%", query]
     if brand:
         clauses.append("p.brand ilike %s")
         params.append(brand)
@@ -205,37 +306,39 @@ async def search_products(
 
     # Collapse the storefront duplicates first, so every ordering below ranks models
     # rather than listings, and `limit` counts products the customer could tell apart.
+    # `canonical_id` catches the variants it was built for; identical names catch the
+    # rows that were never linked, and three identical cards are three identical cards
+    # whatever the ids say.
     by_canonical = (f"select distinct on (p.canonical_id) {COLUMNS} "
                     f"from products p where {where} order by {VARIANT_PICK}")
     deduped = (f"select distinct on (p.brand, lower(p.name)) * from ({by_canonical}) p "
                f"order by p.brand, lower(p.name), (p.currency <> 'USD'), "
                f"(p.hero_image is null), p.price asc nulls last, p.sku")
 
-    # An explicit sort always wins. Otherwise a search is ordered by how well the name
-    # matches — which is the whole point of typing one — and a bare catalog page falls
-    # back to `featured`.
     if sort in SIMPLE_ORDERS:
         sql = f"select * from ({deduped}) p order by {SIMPLE_ORDERS[sort]} limit %s"
     elif query and sort != "featured":
-        # Devices before their spare parts. Trigram similarity rewards short names, so
-        # a search for "s1 pro" returned "Dust Bin For S1 Pro" and "Swivel Wheel For S1
-        # Pro" ahead of the two actual S1 Pro products — the catalog answering a
-        # question nobody asked. Somebody searching a model name wants the machine;
-        # the replacement tank is still there, one screen down.
-        words, pairs = _terms(query)
-        score = " + ".join(["0"] + [f"(p.name ilike %s)::int * 2" for _ in pairs]
-                           + [f"(p.name ilike %s)::int" for _ in words])
-        order_params = ([f"%{t}%" for t in pairs] + [f"%{w}%" for w in words] + [query])
-        # Spare parts behind devices, and multi-item bundles behind the thing itself:
-        # somebody asking for a power bank is answered badly by a power bank taped to a
-        # charging base, however well the words match.
+        # Devices before their spare parts, and the thing itself before a bundle of it
+        # with two others. Trigram similarity rewards short names, so a search for "s1
+        # pro" put "Dust Bin For S1 Pro" above both actual S1 Pro products.
+        def weight(w: str) -> int:
+            df = weights.get(w) or 1
+            return 6 if df <= 20 else 4 if df <= DISTINCTIVE_DF else 1
+
+        score = " + ".join(["0"] + [f"(p.name ilike %s)::int * 3" for _ in pairs]
+                           + [f"(p.name ~* %s)::int * {weight(w)}" for w in words])
+        params += ([f"%{t}%" for t in pairs] + [_pattern(w) for w in words] + [query])
         sql = (f"select * from ({deduped}) p "
                f"order by (case when p.category in ('accessory', 'service') "
                f"then 1 else 0 end), "
                f"(case when p.sku ilike 'BUNDLE-%%' or p.name like '%%+%%' "
-               f"then 1 else 0 end), ({score}) desc, similarity(p.name, %s) desc, "
-               f"(p.hero_image is null), p.name limit %s")
-        params += order_params
+               # The storefront quotes dollars, so a model listed only in euros or
+               # Australian dollars sorts behind the ones a customer here can actually
+               # compare. "The cheapest one that empties itself" came back as A$1,529.99
+               # ranked against US prices, which is not a comparison.
+               f"then 1 else 0 end), (p.currency <> 'USD'), "
+               f"({score}) desc, similarity(p.name, %s) desc, "
+               f"(p.hero_image is null), (p.price is null), p.name limit %s")
     else:
         # Ranking has to happen inside the subquery: a window function cannot be used
         # in the ORDER BY of the select that computes it.
@@ -243,7 +346,45 @@ async def search_products(
                f"  select p.*, {RANK_WINDOW} as rank_in_category from ({deduped}) p"
                f") p order by {FEATURED_ORDER} limit %s")
     params.append(limit)
-    return await db.fetch(sql, params)
+    rows = await db.fetch(sql, params)
+
+    # A head word that narrows to nothing was the wrong head word, not an empty shelf.
+    # Try the next candidate before concluding the catalogue has no answer.
+    if not rows and len(heads) > 1 and not (brand or category):
+        return await search_products(" ".join(w for w in words if w != head),
+                                     brand, category, limit, sort)
+    return rows
+
+
+async def by_skus(skus: List[str]) -> List[Dict[str, Any]]:
+    """Real catalogue rows for a list of SKUs, collapsed and in the order given.
+
+    The vector fallback returns Pinecone metadata, which never passed through any of the
+    collapsing above: it brought back the same model in two currencies, rows with no
+    price, and bundles ahead of the thing itself. Every route to a product card has to
+    leave by the same door, so the fallback's SKUs are looked up here instead.
+    """
+    if not skus:
+        return []
+    rows = await db.fetch(
+        f"select {COLUMNS}, p.canonical_id from products p "
+        f"where p.sku = any(%s) and p.status <> 'invalid'", [list(skus)])
+    order = {s: i for i, s in enumerate(skus)}
+    rows.sort(key=lambda r: order.get(r["sku"], 999))
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    for r in rows:
+        key = (r.get("canonical_id"), (r.get("name") or "").strip().lower())
+        if key[0] in seen or key[1] in seen:
+            continue
+        seen.add(key[0])
+        seen.add(key[1])
+        out.append(r)
+    out.sort(key=lambda r: ((r.get("sku") or "").upper().startswith("BUNDLE-")
+                            or " + " in (r.get("name") or ""),
+                            r.get("price") is None,
+                            order.get(r["sku"], 999)))
+    return out
 
 
 async def get_product(sku: str) -> Optional[Dict[str, Any]]:

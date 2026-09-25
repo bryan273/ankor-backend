@@ -80,9 +80,13 @@ def _normalise_category(value: Optional[str]) -> Optional[str]:
 
 @register("search_products",
           "Find products by name or description. Use when the customer names a product "
-          "you have not resolved yet, or asks what to buy. Pass `category` whenever the "
-          "customer has said what KIND of thing they mean, because a name search alone "
-          "cannot tell a power strip from a power bank. Valid categories: "
+          "you have not resolved yet, or asks what to buy. `query` is a SEARCH PHRASE of "
+          "one to three words naming the product kind or model — 'power bank', 'robot "
+          "vacuum', 'S1 Pro' — never the customer's whole sentence, and never their "
+          "constraints ('for a trip', 'i have a dog'): those go in your own reasoning, "
+          "not the search. Pass `category` whenever the customer has said what KIND of "
+          "thing they mean, because a name search alone cannot tell a power strip from a "
+          "power bank. Valid categories: "
           + PRODUCT_CATEGORIES + ".",
           "query, brand?, category?, k?", label="Looking up the product")
 async def search_products(state: AgentState, query: str = "", brand: Optional[str] = None,
@@ -99,7 +103,8 @@ async def search_products(state: AgentState, query: str = "", brand: Optional[st
     if not rows and category:
         rows = await products.search_products(query, brand, limit=k)
     if not rows:
-        rows = await kb.search_products_vector(query, k=k, category=category)
+        hits = await kb.search_products_vector(query, k=k, category=category)
+        rows = await products.by_skus([h["sku"] for h in hits if h.get("sku")]) or hits
     return {"found": bool(rows), "count": len(rows),
             "products": [{"sku": r.get("sku"), "name": r.get("name"), "brand": r.get("brand"),
                           "category": r.get("category"), "price": r.get("price"),

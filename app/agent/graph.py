@@ -144,6 +144,16 @@ class Agent:
                 call_id="resume", tool=f"step_result_{outcome}", ok=True,
                 summary=f"customer reports: {outcome}",
                 data={"outcome": outcome, "step_id": value.get("step_id")}))
+            # The customer is standing on a step of a flow they can see. Hand that flow
+            # back to this turn rather than hoping the planner looks it up again: it
+            # often does not, and the steps then disappear from under them while the
+            # reply says there is no guide on file for the device it just guided.
+            if state.active_flow:
+                state.observations.append(ToolResult(
+                    call_id="resume_flow", tool="get_troubleshooting_flow", ok=True,
+                    summary=f"the flow the customer is working through: "
+                            f"{state.active_flow.get('symptom', '')}",
+                    data=dict(state.active_flow, current_step=value.get("step_id"))))
             if outcome == "failed":
                 state.perception.fix_failed = True
                 await self._count_failure(state)
@@ -369,6 +379,19 @@ class Agent:
             if photo_candidates:
                 candidates, how = photo_candidates, photo_how
                 resolved = candidates[0] if len(candidates) == 1 else None
+
+        # A shopper asking a follow-up is asking about what is on their screen. After
+        # two chargers were recommended, "does it come with a cable" arrived with the
+        # mention "charger", matched forty of them, and produced a picker listing three
+        # products nobody had mentioned. Narrowing to what was actually shown turns that
+        # into either an answer or a question about the right two things. Only narrowing:
+        # if nothing shown matches, the catalogue candidates stand.
+        if not resolved and len(candidates) > 1 and state.shown_skus:
+            on_screen = [c for c in candidates if c.get("sku") in state.shown_skus]
+            if on_screen:
+                candidates = on_screen
+                if len(on_screen) == 1:
+                    resolved, how = on_screen[0], "conversation"
         state.candidates = candidates
 
         if resolved:
@@ -874,6 +897,21 @@ class Agent:
         for block in _blocks_from_state(state):
             state.blocks.append(block)
             await self.stream.block(block.model_dump())
+        flow = state.observation_by_tool("get_troubleshooting_flow")
+        if flow and flow.data.get("found"):
+            state.active_flow = dict(flow.data)
+            await session_svc.set_meta(state.session_id, "flow", state.active_flow)
+        # Remember what the customer was actually shown, so the next turn's "does it
+        # come with a cable" is about one of these rather than about the catalogue.
+        shown = [i.get("sku") for b in state.blocks
+                 if b.type in (BlockType.PRODUCT_GRID, BlockType.PRODUCT_PICKER)
+                 for i in ((b.payload or {}).get("items") or
+                           (b.payload or {}).get("options") or []) if i.get("sku")]
+        if shown:
+            merged = list(dict.fromkeys(shown + state.shown_skus))[:24]
+            if merged != state.shown_skus:
+                state.shown_skus = merged
+                await session_svc.set_meta(state.session_id, "shown", merged)
 
     def _context_line(self, state: AgentState) -> str:
         bits = []
@@ -1212,6 +1250,33 @@ def _language_name(code: str) -> str:
         (code or "en").lower()[:2], "the same language the customer wrote in")
 
 
+def _shelf_order(products: List[Dict[str, Any]], answer: str) -> List[Dict[str, Any]]:
+    """Put the products the answer actually talks about at the front of the shelf.
+
+    The grid takes the first six of what the search returned, and the composer writes
+    about whichever of them it found most useful, which is not always the first six. A
+    customer was told about a charger at $22.99 with no card for it anywhere on screen
+    while six other chargers sat underneath. Naming a thing and not showing it is a
+    worse failure than showing one thing fewer.
+    """
+    low = (answer or "").lower()
+
+    def rank(p: Dict[str, Any]) -> tuple:
+        name = (p.get("name") or "").lower()
+        # The composer shortens names, so match on the opening words rather than all.
+        head = " ".join(name.split()[:4])
+        named = 0 if head and head in low else 1
+        # A bundle of the thing with two other things is not the thing. It belongs on
+        # the shelf, behind every single product that answers the question on its own:
+        # "the cheapest one that empties itself" was answered with a vacuum taped to two
+        # floor cleaners.
+        bundle = 1 if ((p.get("sku") or "").upper().startswith("BUNDLE-")
+                       or " + " in name or " with " in name) else 0
+        return (named, bundle)
+
+    return sorted(products, key=rank)[:8]
+
+
 def _blocks_from_state(state: AgentState) -> List[Block]:
     """Which interactive blocks this turn earned."""
     blocks: List[Block] = []
@@ -1234,7 +1299,11 @@ def _blocks_from_state(state: AgentState) -> List[Block]:
                 title=f"Fixing: {flow.data.get('symptom', 'the problem')}",
                 symptom=flow.data.get("symptom", ""),
                 estimated_minutes=flow.data.get("estimated_minutes"),
-                steps=steps, current_step=steps[0].step_id)))
+                # Highlight the step the customer says they are on, not step one. They
+                # clicked "I'm stuck" from somewhere, and restarting the list at the top
+                # is the interface forgetting the thing they just told it.
+                steps=steps,
+                current_step=(flow.data.get("current_step") or steps[0].step_id))))
 
     order = state.observation_by_tool("lookup_order")
     if order and order.data.get("found"):
@@ -1299,13 +1368,23 @@ def _blocks_from_state(state: AgentState) -> List[Block]:
             eta=t.get("eta")).model_dump()))
 
     search = state.observation_by_tool("search_products")
+    # There was a gate here that hid the grid when the search looked weak. It made
+    # things worse in a way worth recording: the composer still narrated the products
+    # and their prices from the same tool output, so the customer got prices with
+    # nothing to click, and once got a price attached to the wrong product. Hiding the
+    # evidence does not improve the claim. The fix belonged in retrieval, and that is
+    # where it now is.
     if search and state.perception.intent in (Intent.BUY_ADVICE, Intent.PRODUCT_QUESTION):
         items = [ProductCardItem(
             sku=p.get("sku", ""), name=p.get("name", ""), price=p.get("price"),
             currency=p.get("currency") or "USD",
             image_url=p.get("image_url"), url=p.get("url"),
             badges=["discontinued"] if p.get("status") == "discontinued" else [])
-            for p in (search.data.get("products") or [])[:6] if p.get("sku")]
+            # A card is a photograph and a price. 19 rows carry no price — refurbished
+            # and renewed stock, mostly — and a card with a blank where the price goes
+            # reads as a broken card rather than an honest one.
+            for p in _shelf_order(search.data.get("products") or [], state.answer)
+            if p.get("sku") and p.get("price")][:6]
         if items:
             blocks.append(Block(type=BlockType.PRODUCT_GRID,
                                 payload=ProductGridPayload(items=items).model_dump()))

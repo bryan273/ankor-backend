@@ -70,6 +70,10 @@ COVERAGE_RE = re.compile(
 # require the engine to have run.
 PRICE_RE = re.compile(r"[$€£¥]\s?\d[\d,.]*|\b\d[\d,.]*\s?(?:USD|EUR|GBP|RMB|IDR)\b")
 SKU_RE = re.compile(r"\b[A-Z]\d{3,4}[A-Z0-9]*\b")
+# A link is a fact with a click on it. The shopping pilot caught a draft sending a
+# customer to a product page on the EU site that no tool had returned: right shape,
+# wrong region, and the customer finds out by arriving somewhere that is not their shop.
+URL_RE = re.compile(r"https?://[^\s\])>,]+", re.IGNORECASE)
 # eufy/Anker codes use E, C and F prefixes: E-01, E130, C10, C220, F2. `C` was missing,
 # which is how "C10" reached a customer unchecked — G3 never even looked at it.
 ERROR_CODE_RE = re.compile(r"\b[EeFfCc][-–]?\d{1,3}\b")
@@ -159,6 +163,12 @@ def check(state: AgentState, draft: str) -> Tuple[List[GuardHit], bool]:
     for sku in set(SKU_RE.findall(draft)):
         if sku not in evidence:
             hits.append(GuardHit(rule_id="G3", detail=f"SKU not in any tool result: {sku}"))
+            break
+    for url in set(URL_RE.findall(draft)):
+        cleaned = url.rstrip(".,;:)")
+        if cleaned not in evidence:
+            hits.append(GuardHit(rule_id="G3",
+                                 detail=f"link not in any tool result: {cleaned[:70]}"))
             break
     for code in set(ERROR_CODE_RE.findall(draft)):
         normalised = code.upper().replace("–", "-")

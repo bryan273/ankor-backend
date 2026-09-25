@@ -168,6 +168,19 @@ class AgentState(BaseModel):
     # answered as a fresh question: "that depends on what's wrong with it".
     safety_case: bool = False
     candidates: List[Dict[str, Any]] = Field(default_factory=list)
+    # Every SKU this conversation has actually put on the customer's screen. A shopper
+    # who has just been shown two chargers and asks "does it come with a cable" is
+    # asking about one of THOSE two. Without this the follow-up reached the picker with
+    # no anchor and offered three products that had never appeared, under the heading
+    # "which one do you have" — a question a person who owns nothing yet cannot answer.
+    shown_skus: List[str] = Field(default_factory=list)
+    # The repair flow the customer is currently standing on, and which step they are on.
+    # The steps block was built from THIS turn's `get_troubleshooting_flow` result only,
+    # so clicking "I'm stuck" on step 1 ran the planner again, it did not think to look
+    # the flow up a second time, and the steps vanished from under the customer. The
+    # reply then said there was no guide on file for a device that had just been given
+    # one, two messages further up the same conversation.
+    active_flow: Dict[str, Any] = Field(default_factory=dict)
 
     # reasoning
     iterations: int = 0
