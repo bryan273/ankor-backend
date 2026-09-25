@@ -91,6 +91,9 @@ class OrderItemView(BaseModel):
     name: str
     qty: int = 1
     serial: Optional[str] = None
+    # A line of text is a worse answer to "is this the right order?" than the picture of
+    # the thing. The join to `products` was already there; only the column was missing.
+    image_url: Optional[str] = None
 
 
 class OrderCardPayload(BaseModel):

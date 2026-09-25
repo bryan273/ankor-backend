@@ -260,6 +260,7 @@ async def lookup_order(state: AgentState, order_no: Optional[str] = None,
                "status": o.get("status"), "customer_name": o.get("customer_name"),
                "items": [{"sku": i.get("sku"), "name": i.get("name"), "qty": i.get("qty"),
                           "serial": i.get("serial"), "category": i.get("category"),
+                          "hero_image": i.get("hero_image"),
                           "warranty_months": i.get("warranty_months")}
                          for i in o.get("items", [])],
                "source": o.get("source", "demo")}

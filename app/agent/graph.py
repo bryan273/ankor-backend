@@ -1312,7 +1312,8 @@ def _blocks_from_state(state: AgentState) -> List[Block]:
             order_no=d.get("order_no", ""), channel=d.get("channel", ""),
             purchase_date=d.get("purchase_date"), status=d.get("status"),
             items=[OrderItemView(sku=i.get("sku"), name=i.get("name") or "",
-                                 qty=i.get("qty") or 1, serial=i.get("serial"))
+                                 qty=i.get("qty") or 1, serial=i.get("serial"),
+                                 image_url=i.get("hero_image"))
                    for i in d.get("items", [])],
         ).model_dump()))
 

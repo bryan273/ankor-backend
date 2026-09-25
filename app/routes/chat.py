@@ -12,10 +12,11 @@ from fastapi.responses import StreamingResponse
 from app.agent.graph import Agent
 from app.deps import require_api_key
 from app.config import settings
-from app.errors import BlockStale, Busy, NotFound
+from app.errors import BadRequest, BlockStale, Busy, NotFound
 from app.routes.health import bump
 from app.schemas.agent import AgentState, Perception
-from app.schemas.api import ChatActionRequest, ChatRequest
+from app.schemas.api import (ChatActionRequest, ChatRequest, HumanReplyRequest,
+                             TakeCaseRequest)
 from app.services import sessions as session_svc
 from app.sse import EVENT_VOCAB_VERSION, Event, SSEStream
 
@@ -317,3 +318,53 @@ async def get_session(session_id: str, _: str = Depends(require_api_key)) -> Dic
 async def get_messages(session_id: str, limit: int = 50,
                        _: str = Depends(require_api_key)) -> Dict[str, Any]:
     return {"messages": await session_svc.messages_with_blocks(session_id, limit)}
+
+
+# ── the human half of the desk ────────────────────────────────────────────────
+#
+# Everything above this line is the automated agent answering a customer. These three are
+# the person who takes the case off it: they claim it, they type their own replies, and
+# they close it. The console had buttons for the first of those and nothing behind them,
+# so a case looked taken until the page was reloaded and then looked untouched again.
+
+
+@router.post("/chat/reply")
+async def human_reply(req: HumanReplyRequest,
+                      _: str = Depends(require_api_key)) -> Dict[str, Any]:
+    """A message written by a person on the support desk, not by the agent.
+
+    Stored with role `human` so the console can show who wrote it. The history the model
+    reads maps it to an assistant turn, because that is what it is to the customer: the
+    last thing they were told.
+    """
+    text = (req.text or "").strip()
+    if not text:
+        raise BadRequest("an empty reply is not a reply", {})
+    session = await session_svc.get_session(req.session_id)
+    if not session:
+        raise NotFound("no such session", {"session_id": req.session_id})
+    message_id = await session_svc.add_message(req.session_id, "human", text)
+    log.info("console.human_reply", session=req.session_id, chars=len(text))
+    return {"message_id": message_id, "role": "human", "text": text}
+
+
+@router.post("/cases/{session_id}/take")
+async def take_case(session_id: str, req: TakeCaseRequest,
+                    _: str = Depends(require_api_key)) -> Dict[str, Any]:
+    session = await session_svc.get_session(session_id)
+    if not session:
+        raise NotFound("no such session", {"session_id": session_id})
+    claim = await session_svc.take_case(session_id, (req.name or "Support").strip())
+    log.info("console.case_taken", session=session_id, by=claim["name"])
+    return {"assigned": claim}
+
+
+@router.post("/cases/{session_id}/resolve")
+async def resolve_case(session_id: str, req: TakeCaseRequest,
+                       _: str = Depends(require_api_key)) -> Dict[str, Any]:
+    session = await session_svc.get_session(session_id)
+    if not session:
+        raise NotFound("no such session", {"session_id": session_id})
+    done = await session_svc.resolve_case(session_id, (req.name or "").strip())
+    log.info("console.case_resolved", session=session_id)
+    return {"resolved": done}

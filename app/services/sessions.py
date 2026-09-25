@@ -8,6 +8,7 @@ process memory.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import structlog
@@ -114,7 +115,30 @@ async def history(session_id: str, limit: int = 12) -> List[Dict[str, str]]:
         "order by created_at desc limit %s",
         (session_id, limit),
     )
-    return [{"role": r["role"], "content": r["text"]} for r in reversed(rows)]
+    # `human` is a person on the support desk typing into the console. To the model it
+    # is an assistant turn: it is what the customer was last told, and a turn that
+    # followed it has to make sense after it. Only the console cares who wrote it.
+    return [{"role": "assistant" if r["role"] == "human" else r["role"],
+             "content": r["text"]} for r in reversed(rows)]
+
+
+async def take_case(session_id: str, name: str) -> Dict[str, Any]:
+    """Claim a case for a human, and keep the claim.
+
+    "Take this case" used to do nothing but build the briefing, so the moment the page
+    was reloaded there was no sign anyone had picked it up, and two people could work the
+    same conversation without either knowing.
+    """
+    claim = {"name": name, "at": datetime.now(timezone.utc).isoformat()}
+    await set_meta(session_id, "assigned", claim)
+    return claim
+
+
+async def resolve_case(session_id: str, by: str = "") -> Dict[str, Any]:
+    """Close it. The transcript stays; the inbox stops asking anyone to look at it."""
+    done = {"at": datetime.now(timezone.utc).isoformat(), "by": by}
+    await set_meta(session_id, "resolved", done)
+    return done
 
 
 async def messages_with_blocks(session_id: str, limit: int = 50) -> List[Dict[str, Any]]:
@@ -329,7 +353,13 @@ async def list_sessions(limit: int = 40, unresolved_only: bool = False) -> List[
                t.status              as ticket_status,
                -- A turn that paused on a block is a customer sitting and waiting. The
                -- checkpoint lives in sessions.meta rather than its own table.
-               (s.meta ? 'checkpoint') as awaiting
+               (s.meta ? 'checkpoint') as awaiting,
+               -- Who owns this case, and whether it is finished. Both live in `meta`
+               -- rather than their own columns: the inbox only ever asks "is it taken"
+               -- and "is it closed", and a jsonb key answers that without a migration.
+               s.meta -> 'assigned' ->> 'name'  as assigned_to,
+               s.meta -> 'assigned' ->> 'at'    as assigned_at,
+               s.meta -> 'resolved' ->> 'at'    as resolved_at
         from sessions s
         left join customers c on c.id = s.customer_id
         left join products  p on p.sku = s.resolved_sku

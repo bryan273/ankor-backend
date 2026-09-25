@@ -20,6 +20,16 @@ class ChatRequest(BaseModel):
     client_context: ClientContext = Field(default_factory=ClientContext)
 
 
+class HumanReplyRequest(BaseModel):
+    """A support agent typing into the console, rather than a customer typing into chat."""
+    session_id: str
+    text: str = ""
+
+
+class TakeCaseRequest(BaseModel):
+    name: str = "Support"
+
+
 class ChatActionRequest(BaseModel):
     session_id: str
     block_id: str

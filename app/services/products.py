@@ -673,6 +673,21 @@ async def disambiguate(
         owned = await owned_in_category(customer_id, " ".join(mentions or []) + " " + current)
         if owned:
             return owned, [owned], "purchase_history"
+        # The alias table holds model names, not category words: "robot vacuum" matches
+        # nothing in it, and nothing in it is what the caller got. So the shop answered
+        # "my robot vacuum is showing an error code" with "which eufy or Anker model is
+        # it?" while selling twenty-three of them and being perfectly able to show four.
+        #
+        # The catalogue search already knows how to turn a category phrase into the
+        # products in it, so ask it, and offer the result as something to point at. Only
+        # when the answers agree on what kind of thing they are: a picker that mixes
+        # categories reads as the agent having understood nothing.
+        phrase = " ".join(mentions or []).strip() or current
+        guess = await search_products(phrase, limit=6) if phrase else []
+        kinds = {g.get("category") for g in guess if g.get("category")}
+        if len(guess) > 1 and len(kinds) == 1:
+            log.info("products.category_picker", phrase=phrase[:50], n=len(guess))
+            return None, guess[:4], "generic_category"
         return None, [], "no_match"
 
     owned = await owned_products(customer_id, [c["product_id"] for c in candidates])
@@ -690,6 +705,19 @@ async def disambiguate(
         owned = await owned_in_category(customer_id, " ".join(mentions or []) + " " + current)
         if owned:
             return owned, [owned], "purchase_history"
+        # Refusing to PIN a SKU from a generic phrase is right. Returning nothing at all
+        # was not: the caller reads an empty candidate list as "no idea what they mean"
+        # and falls back to asking in prose, so "my robot vacuum is showing an error
+        # code" got "which eufy or Anker model is it?" while the shop sells twenty-three
+        # of them and could simply have shown four. Hand the candidates back unresolved
+        # so the customer can point at one.
+        #
+        # Only when they are all the same kind of thing. A picker that mixes categories
+        # is the failure this branch exists to prevent, and it reads as the agent having
+        # understood nothing.
+        kinds = {c.get("category") for c in candidates if c.get("category")}
+        if len(kinds) == 1 and len(candidates) > 1:
+            return None, candidates[:4], "generic_category"
         return None, [], "generic"
 
     if len(candidates) == 1:

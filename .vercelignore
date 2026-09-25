@@ -1,0 +1,30 @@
+# What never needs to reach a serverless function.
+#
+# The bundle limit is 500 MB for Python, which sounds generous until you notice `data/`
+# alone is 3,826 files: the crawled corpus, the eval photographs, and every image anyone
+# has ever uploaded to a local run. None of it is read at runtime, because the corpus
+# lives in Pinecone and the uploads live in the database. Shipping it would cost cold
+# start time on every instance for files nothing opens.
+
+data/
+logs/
+scripts/
+tests/
+docs/
+db/
+
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+.env
+.env.*
+!.env.example
+.secrets/
+
+Dockerfile
+.dockerignore
+pytest.ini
+run.py

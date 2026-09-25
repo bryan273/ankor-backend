@@ -66,7 +66,7 @@ async def lookup_order(order_no: Optional[str] = None, email: Optional[str] = No
     row["items"] = await db.fetch(
         """
         select oi.qty, oi.serial, p.sku, p.name, p.category, p.warranty_months,
-               p.id::text as product_id
+               p.hero_image, p.id::text as product_id
         from order_items oi left join products p on p.id = oi.product_id
         where oi.order_id = %s
         """,

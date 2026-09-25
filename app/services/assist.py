@@ -43,7 +43,7 @@ Return ONLY JSON:
   "summary": "2-3 sentences: who they are, what is broken, what has been established, \
 where it stands right now",
   "customer_state": "one short phrase for how this person is feeling and why",
-  "watch_out": "the single thing most likely to go wrong in this conversation — a \
+  "watch_out": "the single thing most likely to go wrong in this conversation : a \
 promise not to make, a step already tried, a sensitivity. One sentence.",
   "open_questions": ["anything still unknown that the colleague will need"],
   "suggested_replies": [
@@ -52,9 +52,14 @@ the colleague's voice, ready to send"}}
   ]
 }}
 
-Rules for `suggested_replies`: give two or three, each a genuinely different approach — \
+Rules for `suggested_replies`: give two or three, each a genuinely different approach, \
 not three phrasings of the same thing. Write them SHORT, the way a person types in a \
-chat window, and never promise anything the facts above do not support."""
+chat window, and never promise anything the facts above do not support.
+
+NEVER use a long dash. No em dash, no en dash, anywhere in this JSON: not in the summary,
+not in `watch_out`, not inside a suggested reply. Use a comma, a colon, or start a new
+sentence. A dash in a line a colleague is about to paste into a chat window is the one
+thing that makes it read as machine written, and they notice before the customer does."""
 
 
 def _transcript(messages: List[Dict[str, Any]], limit: int = 14) -> str:

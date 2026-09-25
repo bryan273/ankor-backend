@@ -129,18 +129,37 @@ async def save_attachment(session_id: Optional[str], raw: bytes, mime: str,
     facts = await describe_image(raw, mime)
     import datetime
     import pathlib
+    import tempfile
     import uuid
     att_uuid = uuid.uuid4().hex
     ext = {"image/png": ".png", "image/webp": ".webp"}.get(mime, ".jpg")
-    folder = pathlib.Path("data/uploads")
-    folder.mkdir(parents=True, exist_ok=True)
-    path = folder / f"{att_uuid}{ext}"
-    path.write_bytes(raw)
+
+    def keep_a_local_copy(name: str, blob: bytes) -> Optional[str]:
+        """Write to disk, and shrug if the disk will not have it.
+
+        This used to run first and unconditionally, which cost every upload a second
+        write it did not need, and would have taken the whole endpoint down on any
+        read-only filesystem: serverless runtimes give you nothing writable except a
+        temp directory, and `mkdir` raises before the real upload is even attempted.
+        The bucket is the archive; this is the fallback for when the bucket is not
+        reachable, so it belongs after it and inside a try.
+        """
+        for folder in (pathlib.Path("data/uploads"),
+                       pathlib.Path(tempfile.gettempdir()) / "ankor-uploads"):
+            try:
+                folder.mkdir(parents=True, exist_ok=True)
+                target = folder / name
+                target.write_bytes(blob)
+                return str(target)
+            except OSError:
+                continue
+        log.warning("vision.no_local_copy", attachment=att_uuid)
+        return None
 
     # Foldered by month so the bucket stays browsable once there are thousands.
     month = datetime.datetime.now(datetime.timezone.utc).strftime("%Y/%m")
     remote = await storage.upload(f"{month}/{att_uuid}{ext}", raw, mime)
-    storage_path = remote or str(path)
+    storage_path = remote or keep_a_local_copy(f"{att_uuid}{ext}", raw)
 
     # A separate small copy for previews. The chat draws these at 56 px and the console
     # at 64; shipping the original meant four seconds and 1.6 MB to paint a thumbnail.
@@ -150,9 +169,7 @@ async def save_attachment(session_id: Optional[str], raw: bytes, mime: str,
         thumb_path = await storage.upload(f"{month}/thumb/{att_uuid}.jpg", thumb,
                                           "image/jpeg")
         if not thumb_path:
-            local_thumb = folder / f"{att_uuid}_thumb.jpg"
-            local_thumb.write_bytes(thumb)
-            thumb_path = str(local_thumb)
+            thumb_path = keep_a_local_copy(f"{att_uuid}_thumb.jpg", thumb)
 
     row = await db.fetch_one(
         """

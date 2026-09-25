@@ -8,6 +8,7 @@ A single async pool is opened at startup and closed at shutdown.
 """
 from __future__ import annotations
 
+import os
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Dict, List, Optional, Sequence
 
@@ -22,8 +23,21 @@ log = structlog.get_logger(__name__)
 _pool: Optional[AsyncConnectionPool] = None
 
 
-async def init_pool(min_size: int = 1, max_size: int = 10) -> AsyncConnectionPool:
+async def init_pool(min_size: Optional[int] = None,
+                    max_size: Optional[int] = None) -> AsyncConnectionPool:
+    """Open the pool. Sizes come from the environment so a serverless instance can hold
+    two connections while a long-lived server holds ten.
+
+    On Vercel each instance is its own process with its own pool, and several can be
+    alive at once. Ten connections per instance against one Supabase pooler is a way to
+    run out of connections while the app looks idle. A small pool also means a cold start
+    does not sit waiting for ten handshakes before it answers anything.
+    """
     global _pool
+    if min_size is None:
+        min_size = int(os.getenv("DB_POOL_MIN", "1"))
+    if max_size is None:
+        max_size = int(os.getenv("DB_POOL_MAX", "10"))
     if _pool is None:
         url = settings.db_url
         if not url:
@@ -60,6 +74,16 @@ def pool() -> AsyncConnectionPool:
 
 @asynccontextmanager
 async def connection() -> AsyncIterator[Any]:
+    """Borrow a connection, opening the pool first if nothing has yet.
+
+    `lifespan` opens it on a normal server. A serverless runtime may never run lifespan
+    at all, and the failure mode when it does not is miserable to read: the pool is never
+    created, every query raises "pool not initialised", and it looks like a database
+    outage rather than a missing startup hook. Opening on first use costs one check per
+    query and removes the whole class of problem.
+    """
+    if _pool is None:
+        await init_pool()
     async with pool().connection() as conn:
         yield conn
 
