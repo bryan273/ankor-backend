@@ -3,6 +3,10 @@
 > Anker 首届黑客松挑战赛 · 赛道 04 智能服务（真正听懂，真正解决）
 > **Track 4 — Intelligent Services.** An after-sales support agent that reads the person, not just the sentence.
 
+**📚 Competition research:** [`docs/competition/`](docs/competition/) — rules & regulation corpus,
+source manifest, PRD, and the deterministic scraper toolkit, with the method for extending it.
+Companion task: [`docs/tasks/TASK-research-extension.md`](docs/tasks/TASK-research-extension.md).
+
 **⚠️ Active task (temporary):** [`docs/tasks/TASK-schema-dedupe.md`](docs/tasks/TASK-schema-dedupe.md) —
 schema/code alignment + product dedupe, owner: Bryan. Read it before touching `products`,
 `dealers`, `warranty_policies` or the embed pipeline. It carries the binding git protocol:
