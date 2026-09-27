@@ -9,7 +9,7 @@ schema/code alignment + product dedupe, owner: Bryan. Read it before touching `p
 every action is a commit, and every commit adds a row to that document's append-only handoff
 log. **Remove this pointer together with that document** when the task closes out.
 
-FastAPI + a hand-rolled ReAct loop over `gpt-5.6-terra`, grounded in a real crawl of Anker's product catalog and support knowledge base. Frontend lives in [`anker-hackathon-frontend`](https://github.com/bryan273/anker-hackathon-frontend).
+FastAPI + a hand-rolled ReAct loop over `gpt-5.6-terra`, grounded in a real crawl of Anker's product catalog and support knowledge base. Frontend lives in [`ankor-frontend`](https://github.com/bryan273/ankor-frontend).
 
 ---
 
