@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional
 import structlog
 
 from app.agent import guard as guard_mod
-from app.agent import prompts, tools
+from app.agent import i18n, prompts, tools
 from app.agent.policy import SAFETY_INSTRUCTION, policy_for
 from app.clients.llm import get_llm
 from app.clients.rkapi import parse_json_loose
@@ -77,11 +77,18 @@ class Agent:
         self.stream = stream
         self.llm = get_llm()
         self.traces: List[Dict[str, Any]] = []
+        # Which language the FIXED strings render in (stage names, fallback labels and
+        # chips). It starts as the locale the UI is set to, because the first stages
+        # open before anything has read the message, and tightens to the language the
+        # customer actually wrote in as soon as perception has run — someone typing
+        # Chinese into an English-toggled page should not get an English trail.
+        self.lang = "en"
 
     async def _step_start(self, key: str, iteration: int = 0,
                           label: Optional[str] = None) -> None:
         ord_, default_label, description = STEPS[key]
-        await self.stream.stage_start(key, label or default_label, description=description,
+        await self.stream.stage_start(key, i18n.ui(label or default_label, self.lang),
+                                      description=i18n.ui(description, self.lang),
                                       ord=ord_, node=key, iteration=iteration)
 
     async def _step_done(self, key: str, **detail: Any) -> None:
@@ -95,6 +102,7 @@ class Agent:
 
     async def run(self, state: AgentState) -> AgentState:
         try:
+            self.lang = state.locale or "en"
             await self._ingest(state)
             if await self._safety_shortcut(state):
                 return state
@@ -102,6 +110,7 @@ class Agent:
             # output. Running them in sequence spent a whole round trip for nothing, and
             # on a 3-lane key pool a round trip is seconds the customer is watching.
             await asyncio.gather(self._rewrite(state), self._perceive(state))
+            self.lang = state.perception.language or state.locale or "en"
             if state.perception.fix_failed:
                 await self._count_failure(state)
             if state.safety_case:
@@ -130,7 +139,17 @@ class Agent:
     async def resume(self, state: AgentState, action_id: str,
                      value: Dict[str, Any]) -> AgentState:
         """Continue a paused turn after a block action, without replaying it."""
+        self.lang = state.perception.language or state.locale or "en"
         await self._step_start("understand", label="Picking up where we left off")
+        # A resumed turn skips `_disambiguate`, which is what normally carries the device
+        # this conversation already settled on into the turn. So a click arrived with no
+        # product at all, and the customer who had just been given steps for their X10
+        # Pro Omni was asked "which robot is it?" the moment they pressed a button on
+        # those steps. The session has known the answer since it was resolved.
+        if not state.resolved and state.session_sku:
+            prior = await product_svc.get_product(state.session_sku)
+            if prior:
+                state.resolved = _resolved_from(prior, "conversation")
         if action_id == "select_product":
             row = await product_svc.get_product(value.get("sku", ""))
             if row:
@@ -148,7 +167,17 @@ class Agent:
             # back to this turn rather than hoping the planner looks it up again: it
             # often does not, and the steps then disappear from under them while the
             # reply says there is no guide on file for the device it just guided.
-            if state.active_flow:
+            #
+            # Except when they just said it WORKED. The flow is how the turn grows its
+            # checklist block, so handing a finished one back redrew all five steps under
+            # "glad that sorted it", with the same It worked / Still not fixed buttons
+            # beneath them — the repair they had closed, reopened by the act of closing
+            # it. A finished flow is also cleared from the session, or the next unrelated
+            # question resurrects it.
+            if outcome == "worked":
+                state.active_flow = {}
+                await session_svc.set_meta(state.session_id, "flow", {})
+            elif state.active_flow:
                 state.observations.append(ToolResult(
                     call_id="resume_flow", tool="get_troubleshooting_flow", ok=True,
                     summary=f"the flow the customer is working through: "
@@ -165,6 +194,23 @@ class Agent:
         elif action_id in ("confirm_handoff", "open_ticket"):
             state.user_message = "Please put me through to a person."
             state.perception.intent = Intent.ESCALATE_REQUEST
+        elif action_id == "keep_trying":
+            # The block offers this button and nothing here answered it, so the turn ran
+            # with whatever message the checkpoint happened to hold and the agent was
+            # left to guess. It guessed: a customer who had just said "I've tried
+            # everything" was answered with "I can see your order ANK-2026-17883, what's
+            # going on with it?" — a different conversation entirely, on the one click
+            # that means "stay with me".
+            #
+            # So say plainly what they chose, and remember the refusal: offering the
+            # same human again on the very next turn is how declining once becomes being
+            # asked every turn. The offer comes back when a NEW fix fails.
+            state.user_message = ("No, not yet — I'd rather keep trying. "
+                                  "What else can I check?")
+            state.perception.intent = Intent.TROUBLESHOOT
+            state.handoff_declined_at = state.failed_attempts
+            await session_svc.set_meta(state.session_id, "handoff_declined_at",
+                                       state.failed_attempts)
         elif action_id == "quick_reply":
             state.user_message = value.get("text", state.user_message)
         elif action_id == "submit":
@@ -244,7 +290,8 @@ class Agent:
         call_id = f"call_safety_{uuid.uuid4().hex[:6]}"
         await self.stream.emit(Event.TOOL_CALL, {
             "call_id": call_id, "tool": "create_ticket",
-            "label": "Opening an urgent ticket", "args_preview": "safety escalation"})
+            "label": i18n.ui("Opening an urgent ticket", self.lang),
+            "args_preview": "safety escalation"})
         result = await tools.run_tool(state, "create_ticket", {
             "summary": f"SAFETY: {state.user_message[:160]}",
             "priority": "urgent", "reason": "safety keywords detected"}, call_id=call_id)
@@ -455,12 +502,14 @@ class Agent:
         quote, and it has something better to offer — where the label actually is, so the
         customer can settle it themselves in one go instead of guessing from thumbnails.
         """
-        options = ", ".join(f"{c['brand']} {c['name']}" for c in candidates[:4])
-        prompt = (prompts.PICKER_FROM_PHOTO.format(options=options,
-                                                   where_to_look=where_to_look
-                                                   or "on a sticker on the device")
+        options = ", ".join(_branded(c) for c in candidates[:4])
+        language = _language_name(self.lang)
+        where = where_to_look or i18n.ui("on a sticker on the device", self.lang)
+        prompt = (prompts.PICKER_FROM_PHOTO.format(options=options, where_to_look=where,
+                                                   language=language)
                   if not mention else
-                  prompts.PICKER_QUESTION.format(mention=mention, options=options))
+                  prompts.PICKER_QUESTION.format(mention=mention, options=options,
+                                                 language=language))
         try:
             data, usage = await self.llm.json_complete(
                 [{"role": "user", "content": prompt}], max_tokens=900, default={})
@@ -474,11 +523,11 @@ class Agent:
         except Exception as e:  # noqa: BLE001
             log.warning("agent.picker_question_failed", error=str(e)[:120])
         if not mention:
-            return ("I can see the type of device, but not which model. The model number "
-                    f"is usually {where_to_look or 'on a sticker on the device'}. "
-                    "Is it one of these?")
-        return (f"Quick check: \"{mention}\" is used for more than one of our products. "
-                "Which of these is yours?")
+            return i18n.ui("I can see the type of device, but not which model. The model "
+                           "number is usually {where_to_look}. Is it one of these?",
+                           self.lang, where_to_look=where)
+        return i18n.ui('Quick check: "{mention}" is used for more than one of our '
+                       "products. Which of these is yours?", self.lang, mention=mention)
 
     async def _react(self, state: AgentState) -> None:
         """The reasoning loop. Think, act, observe, repeat — with a hard iteration cap."""
@@ -521,7 +570,7 @@ class Agent:
             call = ToolCall(call_id=f"call_{state.iterations}", tool=action, args=args)
             state.tool_calls.append(call)
             await self.stream.emit(Event.TOOL_CALL, {
-                "call_id": call.call_id, "tool": action, "label": label,
+                "call_id": call.call_id, "tool": action, "label": i18n.ui(label, self.lang),
                 "args_preview": _preview(args)})
 
             result = await tools.run_tool(state, action, args, call_id=call.call_id)
@@ -545,7 +594,8 @@ class Agent:
         excluded = [] if state.resolved else ["get_troubleshooting_flow"]
         data, usage = await self.llm.json_complete(
             [{"role": "system", "content": prompts.PLAN_SYSTEM.format(
-                tools=tools.tool_specs(excluded), situation=situation)},
+                tools=tools.tool_specs(excluded), situation=situation,
+                language=_language_name(state.perception.language))},
              {"role": "user", "content": state.rewritten_query or state.user_message}],
             max_tokens=2000, default={"action": "answer"},
         )
@@ -777,7 +827,8 @@ class Agent:
         call_id = f"call_g1_{uuid.uuid4().hex[:6]}"
         await self.stream.emit(Event.TOOL_CALL, {
             "call_id": call_id, "tool": "check_warranty",
-            "label": "Checking the warranty rules", "args_preview": "guard G1 repair"})
+            "label": i18n.ui("Checking the warranty rules", self.lang),
+            "args_preview": "guard G1 repair"})
         result = await tools.run_tool(state, "check_warranty", args, call_id=call_id)
         result.data["forced_by_guard"] = True
         state.observations.append(result)
@@ -1238,34 +1289,50 @@ def fallback_suggestions(state: AgentState) -> List[str]:
     warranty = state.observation_by_tool("check_warranty")
     verdict = (warranty.data.get("verdict") if warranty else "") or ""
     product = state.resolved.name if state.resolved else "it"
+    # These are the only customer-facing strings the agent produces without a model, so
+    # they are the only ones that stayed English under a Chinese answer. A Chinese safety
+    # warning under "Is it safe to leave it unplugged in the house?" is the worst place
+    # for it to show, because that is the turn the customer is most alarmed on.
+    lang = state.perception.language or state.locale or "en"
+
+    def s(*texts: str, **kwargs: object) -> List[str]:
+        return [i18n.ui(x, lang, **kwargs) for x in texts]
 
     if state.perception.safety_concern:
-        return ["Is it safe to leave it unplugged in the house?",
-                "How soon will someone contact me?"]
+        return s("Is it safe to leave it unplugged in the house?",
+                 "How soon will someone contact me?")
     if verdict in ("needs_proof", "covered_pending_verification"):
-        return ["What exactly needs to be visible in the photo?",
-                "How long does verification usually take?",
-                "Can I still use it while the claim is open?"]
+        return s("What exactly needs to be visible in the photo?",
+                 "How long does verification usually take?",
+                 "Can I still use it while the claim is open?")
     if verdict == "covered_via_dealer":
-        return ["What if the dealer won't help?",
-                "Do I need the original packaging?",
-                "How long should the repair take?"]
+        return s("What if the dealer won't help?",
+                 "Do I need the original packaging?",
+                 "How long should the repair take?")
     if verdict in ("not_covered_policy", "expired"):
-        return ["What would a paid repair cost?",
-                "Is it worth repairing or replacing?",
-                "Do you have a trade-in option?"]
+        return s("What would a paid repair cost?",
+                 "Is it worth repairing or replacing?",
+                 "Do you have a trade-in option?")
     if state.ticket_id:
-        return ["How do I check on this ticket later?",
-                "Can I add a photo to the ticket?"]
+        return s("How do I check on this ticket later?",
+                 "Can I add a photo to the ticket?")
     if state.observation_by_tool("get_troubleshooting_flow") or \
             state.observation_by_tool("search_kb"):
-        return [f"What if none of that fixes {product}?",
-                "How often should I be doing this?",
-                "Can I talk to a person instead?"]
+        return (s("What if none of that fixes {product}?", product=product)
+                + s("How often should I be doing this?",
+                    "Can I talk to a person instead?"))
     if state.candidates and not state.resolved:
-        return ["I'm not sure which one I have — how do I tell?"]
-    return ["Can I talk to a person instead?",
-            "What else should I check?"]
+        return s("I'm not sure which one I have — how do I tell?")
+    if not state.observations and not state.resolved:
+        # Nothing was looked up, so this turn is the agent asking for something before it
+        # can start: the error code, the model. Chips about resets or warranty here read
+        # as a menu beside a question, and the customer is left with nothing to tap that
+        # answers it.
+        return s("Where do I find the error code?",
+                 "What if there is no code, only a beep?",
+                 "Can I talk to a person instead?")
+    return s("Can I talk to a person instead?",
+             "What else should I check?")
 
 
 def _split_suggestions(draft: str) -> tuple[str, List[str]]:
@@ -1279,6 +1346,24 @@ def _split_suggestions(draft: str) -> tuple[str, List[str]]:
         return answer, []
     items = [s.strip(" -•") for s in raw.split("|")]
     return answer, [s for s in items if s][:3]
+
+
+def _branded(product: Dict[str, Any]) -> str:
+    """"eufy Robot Vacuum Omni S2", not "eufy eufy Robot Vacuum Omni S2".
+
+    Half the catalogue prints the brand inside the product name already (51 of a
+    sampled 100), so prefixing it unconditionally doubled it. The picker prompt is
+    handed these strings and asked to keep product names verbatim, so the doubling
+    reached the customer: an Indonesian picker opened "Boleh tahu Anda punya yang mana:
+    eufy eufy Robot Vacuum Omni S2". English usually got away with it because the model
+    quietly tidied it up, which is exactly why it went unnoticed.
+    """
+    brand, name = (product.get("brand") or "").strip(), (product.get("name") or "").strip()
+    if not name:
+        return brand
+    if not brand or name.lower().startswith(brand.lower()):
+        return name
+    return f"{brand} {name}"
 
 
 def _language_name(code: str) -> str:
@@ -1318,8 +1403,17 @@ def _blocks_from_state(state: AgentState) -> List[Block]:
     """Which interactive blocks this turn earned."""
     blocks: List[Block] = []
 
-    flow = state.observation_by_tool("get_troubleshooting_flow")
-    if flow and flow.data.get("found"):
+    # The most recent lookup that actually FOUND something, not simply the most recent
+    # one. `observation_by_tool` returns the last, and on a resumed turn there are two:
+    # the flow the customer is visibly standing on, re-attached by `resume`, and then
+    # whatever the planner looked up again during `_react`. When that second lookup
+    # missed, it shadowed the first and the checklist vanished from under someone who
+    # had just pressed "Still not fixed" on it. Measured on the original code: three
+    # identical runs of that click returned the steps, the steps, then nothing.
+    flow = next((o for o in reversed(state.observations)
+                 if o.tool == "get_troubleshooting_flow" and o.ok and o.data.get("found")),
+                None)
+    if flow:
         steps_raw = flow.data.get("steps") or []
         steps = []
         for i, s in enumerate(steps_raw[:8], start=1):
@@ -1432,6 +1526,8 @@ def _blocks_from_state(state: AgentState) -> List[Block]:
                  state.failed_attempts)
     created = state.observation_by_tool("create_ticket")
     if (not state.ticket_id and not (created and created.data.get("created"))
+            # They already said no at this many failures. Ask again when a new one lands.
+            and failed > state.handoff_declined_at
             and ((policy.offer_human_early and failed >= 1) or _escalation_due(state))):
         blocks.append(human_handoff(HumanHandoffPayload(
             reason="A couple of fixes have not worked and you have a deadline.",

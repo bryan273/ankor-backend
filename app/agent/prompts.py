@@ -104,6 +104,11 @@ How to work:
 - `thought` appears on the customer's screen. Write "Let me check which S1 Pro you have", \
 not "Invoking search_products with disambiguation flag". No internal names, no JSON, \
 no mention of tools or models.
+- Write `thought` and `user_facing` in {language}, the language the customer is being \
+replied in. They sit on screen right beside the reply, so an English trail under a \
+Chinese answer reads like a second, different system talking over the first. Tool \
+arguments are NOT affected: those stay in the language the catalogue and the manuals \
+are written in, which is English. Think in {language}, search in English.
 - Prefer the cheap deterministic tools first: an exact error-code lookup beats a search, \
 a known order number beats a guess.
 - Do not call the same tool twice with the same arguments. If a tool returned nothing, \
@@ -210,9 +215,18 @@ Emotional handling for this turn:
 Structure your reply as flowing prose or short steps as fits — no rigid template. When you \
 give steps, number them and keep one action per step.
 
-End with a `SUGGESTIONS:` line listing 2-3 follow-up questions the customer probably has \
-but has not asked, separated by ` | `. Make them specific to this conversation. If the turn \
-is finished and nothing sensible follows, write `SUGGESTIONS: none`.
+End with a `SUGGESTIONS:` line, 2-3 items separated by ` | `, written in the customer's \
+voice as the thing they would tap next:
+
+- When your reply ends with a question, the chips answer THAT question. They are the \
+likely replies ("It shows E5", "It only beeps, no code on screen") or the way to find what \
+you asked for ("Where do I see the error code?"). A chip about resetting, models or \
+warranty, offered before they have told you the code, walks away from the question you \
+just asked and leaves them nothing to tap that moves this forward.
+- Otherwise they follow from what you just said. Test each one: if it would read the same \
+under the customer's opening message, it is a generic FAQ, not a follow-up. Drop it.
+- Never suggest a question you already answered in this reply.
+- If the turn is finished and nothing sensible follows, write `SUGGESTIONS: none`.
 
 Reply in {language}."""
 
@@ -305,6 +319,11 @@ distinguishes them in a few words. No preamble.
 
 The products: {options}
 
+Write the question in {language}. This line IS the reply for this turn — the turn pauses \
+here and the customer reads nothing else — so it has to be in their language. Keep the \
+product names themselves exactly as given, in English, because that is how they are \
+printed on the device and in the app.
+
 Return ONLY JSON: {{"question": "..."}}"""
 
 
@@ -314,5 +333,7 @@ Write ONE short friendly line that does two things: says you can see the type bu
 
 Where the number usually is: {where_to_look}
 The options being shown: {options}
+
+Write the line in {language}. It IS the reply for this turn, so it has to be in the customer's language.
 
 Return ONLY JSON: {{"question": "..."}}"""

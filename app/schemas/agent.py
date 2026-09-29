@@ -160,6 +160,11 @@ class AgentState(BaseModel):
     # How many times, across the whole conversation, the customer has reported that a
     # fix did not work. Policy escalates on this, not on the current turn alone.
     failed_attempts: int = 0
+    # The failure count at which this customer last said "let's keep trying" rather than
+    # take a human. Re-offering the same escalation on the very next turn is how a
+    # refusal turns into nagging, so the offer waits for a NEW failure. -1 means they
+    # have never declined one.
+    handoff_declined_at: int = -1
     # The ticket this session already opened, so a follow-up ("how long will that take?")
     # is answered from it instead of from nothing, and a second ticket is never opened.
     open_ticket: Dict[str, Any] = Field(default_factory=dict)

@@ -317,7 +317,15 @@ async def search_products(
 
     if sort in SIMPLE_ORDERS:
         sql = f"select * from ({deduped}) p order by {SIMPLE_ORDERS[sort]} limit %s"
-    elif query and sort != "featured":
+    # `words or pairs` is a guard, not an optimisation. `_terms` only sees [a-z0-9], so a
+    # query with no ASCII word in it tokenises to nothing: every Chinese query does, and so
+    # does an English one made entirely of stopwords ("best", "the best one"). The score
+    # below is then the join of a single "0", and `order by (0) desc` is not a constant in
+    # Postgres — a bare integer there is an ordinal, so it raises InvalidColumnReference:
+    # ORDER BY position 0 is not in select list, and the whole turn 500s. Scoring by term
+    # overlap is meaningless with no terms anyway, so fall through to the featured shelf
+    # and let the caller's vector fallback handle what a name match cannot reach.
+    elif query and (words or pairs) and sort != "featured":
         # Devices before their spare parts, and the thing itself before a bundle of it
         # with two others. Trigram similarity rewards short names, so a search for "s1
         # pro" put "Dust Bin For S1 Pro" above both actual S1 Pro products.

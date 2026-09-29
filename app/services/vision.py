@@ -12,6 +12,7 @@ downstream step to re-read English.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 from typing import Any, Dict, List, Optional
 
@@ -117,6 +118,24 @@ async def describe_image(raw: bytes, mime: str,
     }
 
 
+async def _remembered_facts(digest: str) -> Optional[Dict[str, Any]]:
+    """What a previous upload of these exact bytes was told about them."""
+    try:
+        row = await db.fetch_one(
+            "select vlm_facts from attachments "
+            "where vlm_facts->>'sha256' = %s and vlm_facts ? 'caption' "
+            "order by created_at desc limit 1", (digest,))
+    except Exception as e:  # noqa: BLE001 — a cache that errors must not fail an upload
+        log.warning("vision.cache_read_failed", error=str(e)[:140])
+        return None
+    if not row:
+        return None
+    facts = row.get("vlm_facts") or None
+    if facts:
+        log.info("vision.facts_cached", sha256=digest[:12])
+    return facts
+
+
 async def save_attachment(session_id: Optional[str], raw: bytes, mime: str,
                           filename: str = "") -> Dict[str, Any]:
     """Store the bytes and the facts.
@@ -126,7 +145,21 @@ async def save_attachment(session_id: Optional[str], raw: bytes, mime: str,
     The local copy is still written as a fallback for when the bucket is unreachable or
     unconfigured — a failed archive write must never fail the customer's upload.
     """
-    facts = await describe_image(raw, mime)
+    # The same bytes always describe the same picture, so describing them twice buys
+    # nothing and costs the customer the wait. Measured against the deployed vision
+    # model: 4.6s for the 131 KB sample, and still 3.6s after shrinking it 26x to 5 KB,
+    # which is what says the time is the model thinking rather than the image moving.
+    # That matters most for the quick-tip demos, where the SAME sample photograph is
+    # uploaded on every click and the whole pass lands in the visitor's wait.
+    #
+    # Keyed on the digest of the bytes, kept inside `vlm_facts` so this needs no column
+    # and survives a cold start, which an in-process cache would not on a serverless
+    # runtime. A miss, or any error reading the cache, simply describes the image.
+    digest = hashlib.sha256(raw).hexdigest()
+    facts = await _remembered_facts(digest)
+    if facts is None:
+        facts = await describe_image(raw, mime)
+    facts = dict(facts, sha256=digest)
     import datetime
     import pathlib
     import tempfile

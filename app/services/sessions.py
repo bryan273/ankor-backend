@@ -45,6 +45,20 @@ async def ensure_session(session_id: Optional[str], customer_email: Optional[str
     if session_id:
         existing = await get_session(session_id)
         if existing:
+            # Someone who signs in PART WAY through a conversation used to stay a guest
+            # in it forever: the lookup below only ever ran when the session was being
+            # created, so the turn that finally carried an email arrived at a session
+            # that had already decided nobody was there. The console then listed a
+            # signed-in customer's case under "Guest", and the agent could not see their
+            # orders. Only ever fills a blank: a session that already belongs to someone
+            # is not reassigned by whoever types into it next.
+            if customer_email and not existing.get("customer_id"):
+                await db.execute(
+                    "update sessions s set customer_id = c.id, updated_at = now() "
+                    "from customers c where s.id::text = %s and s.customer_id is null "
+                    "and lower(c.email) = lower(%s)",
+                    (session_id, customer_email))
+                return await get_session(session_id) or existing
             return existing
     customer_id = None
     if customer_email:

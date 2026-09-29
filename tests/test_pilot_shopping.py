@@ -105,3 +105,122 @@ def test_a_product_the_answer_names_comes_first():
     ])
     state.answer = "The Anker 324 Charger (40W) is the one to get."
     assert [i["sku"] for i in _grid(state)] == ["A2", "A1"]
+
+
+# ── a query the ASCII tokeniser cannot see (the Mandarin storefront 500) ──────
+
+def test_a_query_with_no_ascii_words_tokenises_to_nothing():
+    # Not a Mandarin-only problem, which is why it survived an English test suite:
+    # a query made entirely of stopwords empties the same way a Chinese one does.
+    assert _terms("扫地机器人报错了") == ([], [])
+    assert _terms("充电宝") == ([], [])
+    assert _terms("best") == ([], [])
+    assert _terms("the best one") == ([], [])
+
+
+def test_an_untokenisable_query_never_orders_by_a_bare_zero(monkeypatch):
+    """`order by (0) desc` is not a constant in Postgres — a bare integer there is an
+    ordinal, so it raised `InvalidColumnReference: ORDER BY position 0 is not in select
+    list` and every Mandarin turn 500'd in the customer's face."""
+    import asyncio
+
+    from app.clients import db
+    from app.services import products
+
+    seen = []
+
+    async def fake_fetch(sql, params=None):
+        seen.append(sql)
+        return []
+
+    monkeypatch.setattr(db, "fetch", fake_fetch)
+    for query in ("扫地机器人报错了", "充电宝", "best", "the best one"):
+        seen.clear()
+        assert asyncio.run(products.search_products(query, limit=3)) == []
+        assert seen, f"{query!r} issued no query at all"
+        for sql in seen:
+            assert "(0) desc" not in sql, f"{query!r} built a bare-zero ordinal: {sql}"
+
+
+def test_a_query_that_does_tokenise_still_scores_by_term_overlap(monkeypatch):
+    """The guard must not cost English queries their ranking."""
+    import asyncio
+
+    from app.clients import db
+    from app.services import products
+
+    seen = []
+
+    async def fake_fetch(sql, params=None):
+        seen.append(sql)
+        return [{"c": 5}] if " c from products" in sql else []
+
+    monkeypatch.setattr(db, "fetch", fake_fetch)
+    products._DF.clear()
+    asyncio.run(products.search_products("robot vacuum", limit=3))
+    assert any("::int * " in sql for sql in seen), "term-overlap score went missing"
+
+
+# ── the picker's option list (Indonesian picker said "eufy eufy …") ──────────
+
+def test_a_name_that_already_carries_its_brand_is_not_doubled():
+    from app.agent.graph import _branded
+
+    assert _branded({"brand": "eufy", "name": "eufy Robot Vacuum Omni S2"}) \
+        == "eufy Robot Vacuum Omni S2"
+    assert _branded({"brand": "eufy", "name": "eufyCam S330 (eufyCam 3)"}) \
+        == "eufyCam S330 (eufyCam 3)"
+    # Case is a spelling choice, not a different brand.
+    assert _branded({"brand": "Anker", "name": "anker 323 Charger"}) == "anker 323 Charger"
+
+
+def test_a_name_without_its_brand_still_gets_one():
+    from app.agent.graph import _branded
+
+    assert _branded({"brand": "eufy", "name": "Omni S2"}) == "eufy Omni S2"
+    assert _branded({"brand": "", "name": "Omni S2"}) == "Omni S2"
+    assert _branded({"brand": "eufy", "name": ""}) == "eufy"
+
+
+# ── the repair checklist, across a resumed turn ─────────────────────────────
+
+def _flow_obs(call_id: str, found: bool, symptom: str = "reduced suction"):
+    from app.schemas.agent import ToolResult
+
+    return ToolResult(
+        call_id=call_id, tool="get_troubleshooting_flow", ok=True,
+        summary="", data={"found": found, "symptom": symptom, "estimated_minutes": 8,
+                          "steps": [{"step_id": "s1", "instruction": "Empty the dustbin"},
+                                    {"step_id": "s2", "instruction": "Rinse the filter"}]}
+        if found else {"found": False})
+
+
+def _kinds(state):
+    return [b.type.value for b in graph._blocks_from_state(state)]
+
+
+def test_a_later_missed_lookup_does_not_erase_the_checklist():
+    """Pressing "Still not fixed" re-attaches the flow the customer is standing on, and
+    then `_react` runs and may look the flow up again. When that second lookup missed it
+    shadowed the first, because `observation_by_tool` returns the LAST match, and the
+    steps vanished from under them. Three identical runs of that click returned the
+    steps, the steps, then nothing."""
+    state = AgentState(session_id="s", message_id="m")
+    state.perception = Perception(intent=Intent.TROUBLESHOOT)
+    state.observations.append(_flow_obs("resume_flow", found=True))
+    state.observations.append(_flow_obs("call_1", found=False))
+    assert "diagnostic_steps" in _kinds(state)
+
+
+def test_a_flow_that_was_never_found_builds_no_checklist():
+    state = AgentState(session_id="s", message_id="m")
+    state.perception = Perception(intent=Intent.TROUBLESHOOT)
+    state.observations.append(_flow_obs("call_1", found=False))
+    assert "diagnostic_steps" not in _kinds(state)
+
+
+def test_a_found_flow_builds_the_checklist():
+    state = AgentState(session_id="s", message_id="m")
+    state.perception = Perception(intent=Intent.TROUBLESHOOT)
+    state.observations.append(_flow_obs("call_1", found=True))
+    assert "diagnostic_steps" in _kinds(state)

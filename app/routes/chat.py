@@ -190,6 +190,7 @@ async def chat(req: ChatRequest, _: str = Depends(require_api_key)) -> Streaming
         session_sku=session.get("resolved_sku"),
         purchase=((session.get("meta") or {}).get("purchase") or {}),
         failed_attempts=int((session.get("meta") or {}).get("failed_attempts") or 0),
+        handoff_declined_at=int((session.get("meta") or {}).get("handoff_declined_at", -1)),
         open_ticket=((session.get("meta") or {}).get("ticket") or {}),
         safety_case=bool((session.get("meta") or {}).get("safety")),
         shown_skus=list((session.get("meta") or {}).get("shown") or []),
@@ -242,6 +243,12 @@ async def chat_action(req: ChatActionRequest,
         message_id=f"msg_{uuid.uuid4().hex[:12]}",
         user_message=checkpoint.get("user_message", ""),
         rewritten_query=checkpoint.get("rewritten_query", ""),
+        # Resuming reads the language off the restored perception, but a checkpoint
+        # whose shape has moved on is caught and dropped below, and then nothing else
+        # would know: clicking a picker option would answer the Chinese half of the
+        # conversation in English. The session row has carried the locale since it was
+        # opened, so it is the backstop.
+        locale=session.get("locale") or "en",
         attachment_ids=checkpoint.get("attachment_ids", []),
         vlm_facts=checkpoint.get("vlm_facts", []),
         candidates=checkpoint.get("candidates", []),
@@ -252,6 +259,7 @@ async def chat_action(req: ChatActionRequest,
         session_sku=session.get("resolved_sku"),
         purchase=((session.get("meta") or {}).get("purchase") or {}),
         failed_attempts=int((session.get("meta") or {}).get("failed_attempts") or 0),
+        handoff_declined_at=int((session.get("meta") or {}).get("handoff_declined_at", -1)),
         open_ticket=((session.get("meta") or {}).get("ticket") or {}),
         safety_case=bool((session.get("meta") or {}).get("safety")),
         shown_skus=list((session.get("meta") or {}).get("shown") or []),

@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends
 
 from app.deps import require_api_key
 from app.errors import NotFound
+from app.services import kb
 from app.services import orders as order_svc
 from app.services import products as product_svc
 
@@ -17,8 +18,27 @@ router = APIRouter(tags=["catalog"])
 async def list_products(q: str = "", brand: Optional[str] = None,
                         category: Optional[str] = None, limit: int = 24,
                         sort: str = "", _: str = Depends(require_api_key)) -> Dict[str, Any]:
-    rows = await product_svc.search_products(q, brand, category,
-                                             limit=min(limit, 100), sort=sort)
+    k = min(limit, 100)
+    rows = await product_svc.search_products(q, brand, category, limit=k, sort=sort)
+    # The name search is ASCII word matching, so it cannot answer a query written in a
+    # script the catalogue is not written in: every product name here is English, and
+    # "扫地机器人" shares no word with "eufy Robot Vacuum Omni S2". The embeddings are
+    # multilingual and already hold every product, so the same fallback the agent's
+    # `search_products` tool uses is what the storefront search box needs too --
+    # otherwise the shop answers a Chinese shopper with an empty shelf. Routed back
+    # through `by_skus` so a vector hit produces the same collapsed card as a name hit.
+    #
+    # Over-fetch and demote bundles before trimming, because the two paths otherwise
+    # disagree about the same shelf: the scored path already ranks "the thing itself
+    # before a bundle of it with two others", the vector path has no such rule, and a
+    # bundle's name is longer and mentions more, so it embeds nearer. Measured: "robot
+    # vacuum" opened on the plain Omni S2 while 扫地机器人 opened on three accessory
+    # bundles. Same query, same shelf, so it should be the same order.
+    if q and not rows:
+        hits = await kb.search_products_vector(q, k=max(k * 4, 12), category=category)
+        skus = [h["sku"] for h in hits if h.get("sku")]
+        skus.sort(key=lambda s: s.upper().startswith(("BUNDLE-", "COMBO-")))
+        rows = (await product_svc.by_skus(skus))[:k] if skus else []
     return {"count": len(rows), "products": rows}
 
 
